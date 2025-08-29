@@ -1,0 +1,11 @@
+streamlit>=1.36.0
+llama-index>=0.10.50
+llama-index-llms-openai>=0.2.3
+llama-index-embeddings-openai>=0.2.3
+PyPDF2>=3.0.1
+docx2txt>=0.8
+tiktoken>=0.7.0
+pydantic>=2.8.2
+pandas>=2.2.2
+numpy>=1.26.4
+rapidfuzz>=3.9.6
