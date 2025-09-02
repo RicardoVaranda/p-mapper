@@ -1,5 +1,5 @@
 streamlit>=1.36.0
-llama-index>=0.10.50
+llama-index<=0.12.53
 llama-index-llms-openai>=0.2.3
 llama-index-embeddings-openai>=0.2.3
 PyPDF2>=3.0.1
