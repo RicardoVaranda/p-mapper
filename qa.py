@@ -20,6 +20,7 @@ import re
 import json
 import hashlib
 from typing import List, Tuple, Dict, Optional
+from html import escape 
 
 import streamlit as st
 import docx2txt
@@ -156,20 +157,28 @@ def highlight_html(text: str, needle: str, window: int = 400) -> str:
     Text-based fallback preview: returns a small HTML slice around the first occurrence of needle,
     with <mark>...</mark> highlighting. If needle not found, returns a truncated preview.
     """
-    text_norm = re.sub(r"\s+", " ", text)
-    n = needle.strip()
+    text_norm = re.sub(r"\s+", " ", text or "")
+    n = (needle or "").strip()
+
+    def esc(s: str) -> str:
+        # quote=False keeps quotes as-is; safe inside <pre> block
+        return escape(s, quote=False)
+
     if not n:
-        return f"<pre>{st.html.escape(text_norm[:window])}...</pre>"
+        return f"<pre>{esc(text_norm[:window])}...</pre>"
 
     idx = text_norm.lower().find(n.lower())
     if idx == -1:
-        return f"<pre>{st.html.escape(text_norm[:window])}...</pre>"
+        return f"<pre>{esc(text_norm[:window])}...</pre>"
+
     start = max(0, idx - window // 2)
     end = min(len(text_norm), idx + len(n) + window // 2)
-    before = st.html.escape(text_norm[start:idx])
-    match = st.html.escape(text_norm[idx:idx+len(n)])
-    after = st.html.escape(text_norm[idx+len(n):end])
+    before = esc(text_norm[start:idx])
+    match = esc(text_norm[idx:idx + len(n)])
+    after = esc(text_norm[idx + len(n):end])
+
     return f"<pre>{before}<mark>{match}</mark>{after}</pre>"
+
 
 def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text: str):
     """Render a PDF page image and draw highlight rectangles for query_text (best-effort)."""
