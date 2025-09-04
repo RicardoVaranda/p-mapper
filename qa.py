@@ -1,8 +1,24 @@
+# app.py — Regulatory Response Assistant (Streamlit + LlamaIndex <= 0.12.53)
+# -------------------------------------------------------------------------
+# What this app does
+# - Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
+# - Dynamically add questions (via text area or table editor)
+# - Retrieve evidence from both corpora
+# - Draft a regulator-ready response that cites evidence
+# - Judge & classify Source Type (Policy / PriorEmail / Blended / Insufficient)
+# - Show confidence and evidence snippets
+#
+# Key updates in this version:
+# - Strict JSON-only judge prompt
+# - Robust JSON extraction (handles stray text / code fences)
+# - Fallback inference for source_type + confidence if judge JSON fails
+# - Works with your pinned requirements.txt stack
+
 import os
 import io
 import re
 import json
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import docx2txt
@@ -14,27 +30,36 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.schema import NodeWithScore
 
 
+# ---------------------------
+# Page / Header
+# ---------------------------
 st.set_page_config(page_title="Regulatory Response Assistant", layout="wide")
 st.title("📄 Regulatory Response Assistant (LlamaIndex)")
 st.caption("Upload policy docs + prior regulator responses → Ask regulator questions → Get evidence-backed drafts with citations.")
+
 
 # ---------------------------
 # Sidebar: Settings
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
+
     api_key = st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
     base_url = st.text_input("OPENAI_BASE_URL (optional)", value=os.getenv("OPENAI_BASE_URL", ""))
 
     chat_model = st.text_input("Chat Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     embed_model = st.text_input("Embedding Model", value=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
-    top_k = st.slider("Top-K per corpus", 2, 15, 5, 1)
+
+    top_k = st.slider("Top-K per corpus", min_value=2, max_value=15, value=5, step=1)
     temperature = st.slider("Draft temperature", 0.0, 1.0, 0.2, 0.1)
 
+    show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
     st.markdown("---")
-    st.caption("Evidence-driven flow only. No deterministic validations.")
+    st.caption("Evidence-driven flow only. No deterministic or hard-coded validations.")
+
 
 # ---------------------------
 # Configure LlamaIndex defaults
@@ -44,11 +69,21 @@ def configure_settings():
     if base_url:
         kwargs["base_url"] = base_url
 
-    Settings.llm = OpenAI(model=chat_model, temperature=temperature, api_key=api_key or None, **kwargs)
-    Settings.embed_model = OpenAIEmbedding(model=embed_model, api_key=api_key or None, base_url=base_url or None)
+    Settings.llm = OpenAI(
+        model=chat_model,
+        temperature=temperature,
+        api_key=api_key or None,
+        **kwargs,
+    )
+    Settings.embed_model = OpenAIEmbedding(
+        model=embed_model,
+        api_key=api_key or None,
+        base_url=base_url or None
+    )
     Settings.node_parser = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
 configure_settings()
+
 
 # ---------------------------
 # File readers
@@ -67,7 +102,11 @@ def read_docx(file_bytes: bytes) -> str:
     tmp_path = "tmp_doc.docx"
     with open(tmp_path, "wb") as f:
         f.write(file_bytes)
-    text = docx2txt.process(tmp_path)
+    text = docx2txt.process(tmp_path) or ""
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
     return text
 
 def read_txt(file_bytes: bytes) -> str:
@@ -87,6 +126,7 @@ def load_any(file) -> Tuple[str, str]:
     else:
         return name, ""
 
+
 # ---------------------------
 # Session state
 # ---------------------------
@@ -94,46 +134,70 @@ if "policy_docs" not in st.session_state:
     st.session_state.policy_docs: List[Document] = []
 if "email_docs" not in st.session_state:
     st.session_state.email_docs: List[Document] = []
+
 if "policy_index" not in st.session_state:
     st.session_state.policy_index = None
 if "email_index" not in st.session_state:
     st.session_state.email_index = None
+
 if "vector_ready" not in st.session_state:
     st.session_state.vector_ready = False
+
+# sets to identify which filenames belong to which corpus (used for fallback)
+if "policy_files_set" not in st.session_state:
+    st.session_state.policy_files_set = set()
+if "email_files_set" not in st.session_state:
+    st.session_state.email_files_set = set()
+
 
 # ---------------------------
 # Uploaders
 # ---------------------------
 policy_files = st.file_uploader(
     "Upload Company Policy documents (PDF/DOCX/TXT)",
-    type=["pdf", "docx", "txt"], accept_multiple_files=True
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=True
 )
 email_files = st.file_uploader(
     "Upload Prior Regulator Response emails (PDF/DOCX/TXT)",
-    type=["pdf", "docx", "txt"], accept_multiple_files=True
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=True
 )
 
-def add_to_docs(files, target_list):
+def add_to_docs(files, target_list, corpus_name: str):
     for f in files:
         name, text = load_any(f)
         if not text.strip():
             st.warning(f"Unsupported or empty file: {name}")
             continue
         target_list.append(Document(text=text, metadata={"source": name}))
+        if corpus_name == "policy":
+            st.session_state.policy_files_set.add(name)
+        elif corpus_name == "email":
+            st.session_state.email_files_set.add(name)
 
 if policy_files:
-    add_to_docs(policy_files, st.session_state.policy_docs)
+    add_to_docs(policy_files, st.session_state.policy_docs, "policy")
 if email_files:
-    add_to_docs(email_files, st.session_state.email_docs)
+    add_to_docs(email_files, st.session_state.email_docs, "email")
+
+colA, colB = st.columns(2)
+with colA:
+    if st.session_state.policy_docs:
+        st.success(f"Policy docs loaded: {len(st.session_state.policy_docs)}")
+with colB:
+    if st.session_state.email_docs:
+        st.success(f"Prior response docs loaded: {len(st.session_state.email_docs)}")
+
 
 # ---------------------------
-# Build indexes
+# Build / Rebuild Indexes
 # ---------------------------
 if st.button("🔧 Build / Rebuild Indexes"):
     if not st.session_state.policy_docs and not st.session_state.email_docs:
         st.error("Please upload at least one document.")
     else:
-        with st.spinner("Building indexes…"):
+        with st.spinner("Building LlamaIndex vector indexes..."):
             configure_settings()
             st.session_state.policy_index = (
                 VectorStoreIndex.from_documents(st.session_state.policy_docs)
@@ -146,11 +210,15 @@ if st.button("🔧 Build / Rebuild Indexes"):
             st.session_state.vector_ready = True
         st.success("Indexes built.")
 
+
 # ---------------------------
-# Prompts
+# Prompts (strict JSON judge)
 # ---------------------------
 DRAFT_PROMPT = """You are a compliance assistant drafting replies to financial regulators.
-ONLY use the EVIDENCE provided. If evidence is insufficient, state this clearly.
+ONLY use the EVIDENCE provided. If evidence is insufficient or conflicting, state this clearly.
+
+Return a concise regulator-appropriate reply (1–3 short paragraphs) and include inline bracket citations
+like [Doc: <filename>, Node <n>] for each supported statement.
 
 Question:
 {question}
@@ -159,60 +227,141 @@ Evidence:
 {evidence}
 
 Constraints:
-- Draft 1–3 short paragraphs
-- Formal, neutral tone
-- Cite with [Doc: <file>, Node <n>] for support
+- No fabrication beyond evidence.
+- Formal, neutral tone suitable for regulators.
 """
 
-JUDGE_PROMPT = """Judge the draft response:
+JUDGE_PROMPT = """You are validating a regulator-facing draft.
 
-1) Is it supported by evidence?
-2) Best primary source? ("Policy", "PriorEmail", "Blended", "Insufficient")
-3) Confidence 0.0–1.0
-4) Keep strongest citations
+Rules:
+- Return ONLY a single JSON object. No commentary, no markdown, no code fences.
+- JSON must be minified on one line.
+- Use these exact keys: source_type, confidence, keep_citations.
+- source_type ∈ {"Policy","PriorEmail","Blended","Insufficient"}.
+- confidence is a float 0.0–1.0 (use one decimal place).
+- keep_citations is an array of strings; each string must exactly match a citation tag from Evidence.
 
-Return JSON:
-{{
- "source_type": "...",
- "confidence": 0.0,
- "keep_citations": ["[Doc: ...]"]
-}}
+Question: {question}
+
+Draft:
+{draft}
+
+Evidence:
+{evidence}
+
+Return:
+{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}
 """
 
+
 # ---------------------------
-# Retrieval helpers
+# Robust JSON extraction + fallback helpers
 # ---------------------------
-def make_retriever(index, k: int):
-    if not index:
+def extract_first_json_obj(s: str) -> Optional[dict]:
+    """Extract the first valid top-level {...} JSON object from a string."""
+    if not s:
         return None
-    return VectorIndexRetriever(index=index, similarity_top_k=k)
+    s_stripped = s.strip()
+    # Common case: pure JSON
+    if s_stripped.startswith("{") and s_stripped.endswith("}"):
+        try:
+            return json.loads(s_stripped)
+        except Exception:
+            pass
+    # Remove code fences if present
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip(), flags=re.IGNORECASE | re.MULTILINE)
+    # Greedy search for first {...}
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not m:
+        return None
+    block = m.group(0)
+    # Try progressively trimming to valid JSON
+    for end in range(len(block), 1, -1):
+        try:
+            return json.loads(block[:end])
+        except Exception:
+            continue
+    return None
 
-def nodes_to_evidence(nodes) -> Tuple[str, Dict[str, str]]:
-    evidence_lines = []
-    tag_to_file = {}
-    for i, n in enumerate(nodes):
-        src = (n.metadata or {}).get("source", "unknown")
-        tag = f"[Doc: {src}, Node {i}]"
-        text = re.sub(r"\s+", " ", n.get_text()).strip()
-        evidence_lines.append(f"{tag} {text}")
-        tag_to_file[tag] = src
-    return "\n".join(evidence_lines), tag_to_file
+def infer_source_type_from_tags(tags: List[str], tag_to_file: Dict[str, str]) -> str:
+    if not tags:
+        return "Insufficient"
+    policy = sum(1 for t in tags if tag_to_file.get(t) in st.session_state.policy_files_set)
+    email  = sum(1 for t in tags if tag_to_file.get(t) in st.session_state.email_files_set)
+    if policy and email:
+        return "Blended"
+    if policy:
+        return "Policy"
+    if email:
+        return "PriorEmail"
+    return "Insufficient"
 
-def retrieve_across(q: str, k: int):
-    nodes = []
-    if st.session_state.policy_index:
-        r = make_retriever(st.session_state.policy_index, k)
-        nodes += r.retrieve(q)
-    if st.session_state.email_index:
-        r = make_retriever(st.session_state.email_index, k)
-        nodes += r.retrieve(q)
-    return [n.node for n in nodes]
+def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str]) -> float:
+    # Use kept tags if available; else use all
+    use_tags = kept_tags or list(tag_to_score.keys())
+    scores = [tag_to_score.get(t, 0.0) for t in use_tags]
+    if not scores:
+        return 0.0
+    clipped = [min(1.0, max(0.0, float(s))) for s in scores]
+    avg = sum(clipped) / len(clipped)
+    # Slight clamp to avoid absolute 0 or 1 in UI
+    return round(max(0.05, min(0.99, avg)), 3)
+
 
 # ---------------------------
-# Dynamic Questions
+# Retrieval helpers (keep NodeWithScore for fallback)
+# ---------------------------
+def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
+    out: List[NodeWithScore] = []
+    if st.session_state.policy_index:
+        r = VectorIndexRetriever(index=st.session_state.policy_index, similarity_top_k=k)
+        out += r.retrieve(q)
+    if st.session_state.email_index:
+        r = VectorIndexRetriever(index=st.session_state.email_index, similarity_top_k=k)
+        out += r.retrieve(q)
+    return out
+
+def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float]]:
+    """
+    Returns:
+      evidence_text: str
+      tag_to_file: {tag -> filename}
+      tag_to_score: {tag -> similarity_score}
+    """
+    lines, tag_to_file, tag_to_score = [], {}, {}
+    for i, nws in enumerate(nodes_ws):
+        node = nws.node
+        src = (node.metadata or {}).get("source", "unknown")
+        tag = f"[Doc: {src}, Node {i}]"
+        text = re.sub(r"\s+", " ", node.get_text()).strip()
+        lines.append(f"{tag} {text}")
+        tag_to_file[tag] = src
+        try:
+            tag_to_score[tag] = float(nws.score or 0.0)
+        except Exception:
+            tag_to_score[tag] = 0.0
+    return "\n".join(lines), tag_to_file, tag_to_score
+
+
+# ---------------------------
+# Questions UI (text + dynamic editor)
 # ---------------------------
 st.markdown("### Ask Regulator Questions")
-qs_text = st.text_area("Paste questions (one per line):", height=120)
+
+qs_text = st.text_area(
+    "Paste questions (one per line):",
+    height=120,
+    placeholder="e.g., Describe our data retention policy for customer PII.\n"
+                "e.g., Summarize the remediation timeline for the 2023 key management audit finding."
+)
+
+st.markdown("Or build them interactively:")
+q_table = st.data_editor(
+    st.session_state.get("q_table", [{"question": ""}]),
+    num_rows="dynamic",
+    key="q_editor",
+    column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
+)
 
 if st.button("🧠 Generate Responses"):
     if not st.session_state.vector_ready:
@@ -221,58 +370,90 @@ if st.button("🧠 Generate Responses"):
         configure_settings()
         llm = Settings.llm
 
-        questions = [q.strip() for q in qs_text.split("\n") if q.strip()]
+        # Collate deduped questions from both inputs
+        typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
+        edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
+        questions, seen = [], set()
+        for q in (typed + edited):
+            if q not in seen:
+                questions.append(q)
+                seen.add(q)
+
         if not questions:
-            st.warning("Please enter at least one question.")
+            st.warning("Please add at least one question.")
         else:
-            results = []
             for q in questions:
-                nodes = retrieve_across(q, top_k)
-                ev_str, tag2file = nodes_to_evidence(nodes) if nodes else ("(no evidence found)", {})
+                with st.expander(f"❓ {q}", expanded=False):
+                    # Retrieve (with scores)
+                    nodes_ws = retrieve_across(q, top_k)
+                    if nodes_ws:
+                        ev_str, tag2file, tag2score = nodes_to_evidence(nodes_ws)
+                    else:
+                        ev_str, tag2file, tag2score = "(no evidence found)", {}, {}
 
-                draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
-                judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
+                    # Draft
+                    draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
 
-                source_type, confidence, keep = "Insufficient", 0.0, []
-                try:
-                    j = json.loads(judge_raw)
-                    source_type = j.get("source_type", "Insufficient")
-                    confidence = float(j.get("confidence", 0.0))
-                    keep = [str(x) for x in j.get("keep_citations", [])]
-                except Exception:
-                    pass
+                    # Judge (robust JSON parse)
+                    judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
+                    parsed = extract_first_json_obj(judge_raw)
 
-                kept_docs, ev_snips = [], []
-                for line in ev_str.splitlines():
-                    if any(line.startswith(tag) for tag in keep) or not keep:
-                        ev_snips.append(line)
-                        m = re.search(r"\[Doc: (.*?), Node \d+\]", line)
-                        if m:
-                            kept_docs.append(m.group(1))
+                    if parsed:
+                        source_type = parsed.get("source_type", "Insufficient")
+                        keep = [str(x) for x in parsed.get("keep_citations", [])]
+                        try:
+                            confidence = float(parsed.get("confidence", 0.0))
+                        except Exception:
+                            confidence = 0.0
+                    else:
+                        # Fallback: pick top-3 by similarity, infer source_type & confidence
+                        sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
+                        keep = [t for (t, _) in sorted_tags[:3]]
+                        source_type = infer_source_type_from_tags(keep, tag2file)
+                        confidence = confidence_from_scores(tag2score, keep)
 
-                results.append({
-                    "question": q,
-                    "suggested_response": draft,
-                    "source_type": source_type,
-                    "confidence": round(confidence, 3),
-                    "source_docs": list(dict.fromkeys(kept_docs))[:5],
-                    "evidence_snippets": ev_snips[:5]
-                })
+                    # Derive kept docs + snippets
+                    ev_snips, kept_docs = [], []
+                    if ev_str != "(no evidence found)":
+                        lines = ev_str.splitlines()
+                        tag_set = set(keep) if keep else set()
+                        if tag_set:
+                            for line in lines:
+                                tag = line.split("]")[0] + "]"
+                                if tag in tag_set:
+                                    ev_snips.append(line)
+                                    kept_docs.append(tag2file.get(tag, "unknown"))
+                        else:
+                            for line in lines[:4]:
+                                ev_snips.append(line)
+                                m = re.search(r"\[Doc: (.*?), Node \d+\]", line)
+                                if m:
+                                    kept_docs.append(m.group(1))
+                    kept_docs = list(dict.fromkeys(kept_docs))[:5]
 
-            # Render
-            for r in results:
-                with st.expander(f"❓ {r['question']}"):
-                    col1, col2 = st.columns([2,1])
-                    with col1:
+                    # Render UI
+                    left, right = st.columns([2, 1])
+                    with left:
                         st.subheader("Suggested Response")
-                        st.write(r["suggested_response"])
-                    with col2:
+                        st.write(draft)
+                    with right:
                         st.subheader("Assessment")
-                        st.write(f"**Source Type:** {r['source_type']}")
-                        st.write(f"**Confidence:** {r['confidence']}")
+                        st.write(f"**Source Type:** {source_type}")
+                        st.write(f"**Confidence:** {round(confidence, 3)}")
                         st.write("**Source Docs:**")
-                        for d in r["source_docs"]:
-                            st.write(f"- {d}")
+                        if kept_docs:
+                            for d in kept_docs:
+                                st.write(f"- {d}")
+                        else:
+                            st.write("- (none)")
+
                     st.subheader("Evidence Snippets")
-                    for sn in r["evidence_snippets"]:
-                        st.code(sn, language="text")
+                    if ev_snips:
+                        for sn in ev_snips[:6]:
+                            st.code(sn, language="text")
+                    else:
+                        st.write("_No supporting evidence found._")
+
+                    if show_debug:
+                        st.subheader("Debug: Judge Raw Output")
+                        st.code(judge_raw[:4000], language="json")
