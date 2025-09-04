@@ -1,28 +1,41 @@
 # app.py — Regulatory Response Assistant (Streamlit + LlamaIndex <= 0.12.53)
 # -------------------------------------------------------------------------
-# What this app does
-# - Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
-# - Dynamically add questions (via text area or table editor)
-# - Retrieve evidence from both corpora
-# - Draft a regulator-ready response that cites evidence
-# - Judge & classify Source Type (Policy / PriorEmail / Blended / Insufficient)
-# - Show confidence and evidence snippets
-#
-# Key updates in this version:
-# - Strict JSON-only judge prompt
-# - Robust JSON extraction (handles stray text / code fences)
-# - Fallback inference for source_type + confidence if judge JSON fails
-# - Works with your pinned requirements.txt stack
+# Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
+# Dynamically add questions (textarea or table)
+# Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
+# Updates included:
+#   - Strict JSON-only judge prompt (escaped braces)
+#   - Robust JSON extraction
+#   - Fallback inference for source_type + confidence
+#   - SHA-256 fingerprint dedupe for uploaded files
+#   - Accurate counters based on unique file hashes
+#   - "Clear loaded docs" reset button
+#   - Evidence previewer:
+#       * Always: text-page preview with <mark> highlight
+#       * Optional: PDF page image preview with highlight if pymupdf + Pillow available
 
 import os
 import io
 import re
 import json
+import hashlib
 from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import docx2txt
 from PyPDF2 import PdfReader
+
+# Optional preview backends (enable visual PDF previews if present)
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+try:
+    from PIL import Image, ImageDraw
+except Exception:
+    Image = None
+    ImageDraw = None
 
 # ---- LlamaIndex (<=0.12.53) ----
 from llama_index.core import VectorStoreIndex, Document, Settings
@@ -57,8 +70,29 @@ with st.sidebar:
     temperature = st.slider("Draft temperature", 0.0, 1.0, 0.2, 0.1)
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
+
     st.markdown("---")
+    # Show whether visual preview is available
+    if fitz and Image and ImageDraw:
+        st.info("PDF visual preview: **Enabled** (pymupdf + Pillow detected)")
+    else:
+        st.info("PDF visual preview: **Text-only fallback** (install `pymupdf` and `Pillow` to enable images)")
     st.caption("Evidence-driven flow only. No deterministic or hard-coded validations.")
+
+    # Clear/reset button
+    if st.button("🧹 Clear loaded docs (reset)"):
+        st.session_state.policy_docs = []
+        st.session_state.email_docs = []
+        st.session_state.policy_loaded_hashes = set()
+        st.session_state.email_loaded_hashes = set()
+        st.session_state.policy_files_set = set()
+        st.session_state.email_files_set = set()
+        st.session_state.file_bytes_map = {}
+        st.session_state.pdf_page_texts = {}
+        st.session_state.policy_index = None
+        st.session_state.email_index = None
+        st.session_state.vector_ready = False
+        st.success("Cleared all loaded documents and indexes.")
 
 
 # ---------------------------
@@ -86,17 +120,19 @@ configure_settings()
 
 
 # ---------------------------
-# File readers
+# File readers & PDF helpers
 # ---------------------------
-def read_pdf(file_bytes: bytes) -> str:
+def read_pdf_pages(file_bytes: bytes) -> List[Tuple[int, str]]:
+    """Return list of (1-based page_number, text) for a PDF."""
     reader = PdfReader(io.BytesIO(file_bytes))
     out = []
-    for p in reader.pages:
+    for i, p in enumerate(reader.pages):
         try:
-            out.append(p.extract_text() or "")
+            txt = p.extract_text() or ""
         except Exception:
-            continue
-    return "\n".join(out)
+            txt = ""
+        out.append((i + 1, txt))
+    return out
 
 def read_docx(file_bytes: bytes) -> str:
     tmp_path = "tmp_doc.docx"
@@ -112,19 +148,54 @@ def read_docx(file_bytes: bytes) -> str:
 def read_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
 
-def load_any(file) -> Tuple[str, str]:
-    name = file.name
-    data = file.read()
-    file.seek(0)
-    lower = name.lower()
-    if lower.endswith(".pdf"):
-        return name, read_pdf(data)
-    elif lower.endswith(".docx"):
-        return name, read_docx(data)
-    elif lower.endswith(".txt"):
-        return name, read_txt(data)
-    else:
-        return name, ""
+def fingerprint(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def highlight_html(text: str, needle: str, window: int = 400) -> str:
+    """
+    Text-based fallback preview: returns a small HTML slice around the first occurrence of needle,
+    with <mark>...</mark> highlighting. If needle not found, returns a truncated preview.
+    """
+    text_norm = re.sub(r"\s+", " ", text)
+    n = needle.strip()
+    if not n:
+        return f"<pre>{st.html.escape(text_norm[:window])}...</pre>"
+
+    idx = text_norm.lower().find(n.lower())
+    if idx == -1:
+        return f"<pre>{st.html.escape(text_norm[:window])}...</pre>"
+    start = max(0, idx - window // 2)
+    end = min(len(text_norm), idx + len(n) + window // 2)
+    before = st.html.escape(text_norm[start:idx])
+    match = st.html.escape(text_norm[idx:idx+len(n)])
+    after = st.html.escape(text_norm[idx+len(n):end])
+    return f"<pre>{before}<mark>{match}</mark>{after}</pre>"
+
+def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text: str):
+    """Render a PDF page image and draw highlight rectangles for query_text (best-effort)."""
+    if not (fitz and Image and ImageDraw):
+        return None  # visual backend not available
+
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        page = doc[page_num - 1]
+        # Try to find rectangles for a short version of the query
+        q = (query_text or "").strip()
+        if len(q) > 120:
+            q = q[:120]
+        rects = page.search_for(q) if q else []
+        # Render page to image
+        pix = page.get_pixmap(dpi=144)  # reasonably crisp
+        mode = "RGBA" if pix.alpha else "RGB"
+        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+        if rects:
+            draw = ImageDraw.Draw(img)
+            for r in rects[:5]:  # cap highlights
+                draw.rectangle([(r.x0, r.y0), (r.x1, r.y1)], outline=(255, 0, 0), width=4)
+        return img
+    except Exception:
+        return None
 
 
 # ---------------------------
@@ -149,6 +220,20 @@ if "policy_files_set" not in st.session_state:
 if "email_files_set" not in st.session_state:
     st.session_state.email_files_set = set()
 
+# sets of file hashes to dedupe uploads across reruns
+if "policy_loaded_hashes" not in st.session_state:
+    st.session_state.policy_loaded_hashes = set()
+if "email_loaded_hashes" not in st.session_state:
+    st.session_state.email_loaded_hashes = set()
+
+# map of filename -> raw bytes (for previews)
+if "file_bytes_map" not in st.session_state:
+    st.session_state.file_bytes_map: Dict[str, bytes] = {}
+
+# PDF page text cache: filename -> {page_num: text}
+if "pdf_page_texts" not in st.session_state:
+    st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
+
 
 # ---------------------------
 # Uploaders
@@ -166,14 +251,62 @@ email_files = st.file_uploader(
 
 def add_to_docs(files, target_list, corpus_name: str):
     for f in files:
-        name, text = load_any(f)
-        if not text.strip():
-            st.warning(f"Unsupported or empty file: {name}")
+        name = f.name
+        data = f.read()
+        f.seek(0)
+        digest = fingerprint(data)
+
+        # choose the right set for dedupe
+        seen_set = (
+            st.session_state.policy_loaded_hashes
+            if corpus_name == "policy"
+            else st.session_state.email_loaded_hashes
+        )
+
+        if digest in seen_set:
+            continue  # already loaded in this session
+
+        # Parse based on file type
+        lower = name.lower()
+        if lower.endswith(".pdf"):
+            pages = read_pdf_pages(data)
+            if not any(txt.strip() for _, txt in pages):
+                st.warning(f"Empty/unsupported PDF: {name}")
+                continue
+            # One Document per PDF page, so we can keep page metadata
+            for page_num, txt in pages:
+                target_list.append(Document(text=txt, metadata={"source": name, "page": page_num}))
+            # Store for preview
+            st.session_state.file_bytes_map[name] = data
+            st.session_state.pdf_page_texts[name] = {p: t for p, t in pages}
+
+        elif lower.endswith(".docx"):
+            txt = read_docx(data)
+            if not txt.strip():
+                st.warning(f"Empty/unsupported DOCX: {name}")
+                continue
+            target_list.append(Document(text=txt, metadata={"source": name}))
+            # Optionally store for preview (text-only)
+            st.session_state.file_bytes_map[name] = data
+
+        elif lower.endswith(".txt"):
+            txt = read_txt(data)
+            if not txt.strip():
+                st.warning(f"Empty/unsupported TXT: {name}")
+                continue
+            target_list.append(Document(text=txt, metadata={"source": name}))
+            # Optionally store for preview (text-only)
+            st.session_state.file_bytes_map[name] = data
+
+        else:
+            st.warning(f"Unsupported file type: {name}")
             continue
-        target_list.append(Document(text=text, metadata={"source": name}))
+
+        # mark as seen and register corpus membership
+        seen_set.add(digest)
         if corpus_name == "policy":
             st.session_state.policy_files_set.add(name)
-        elif corpus_name == "email":
+        else:
             st.session_state.email_files_set.add(name)
 
 if policy_files:
@@ -181,13 +314,17 @@ if policy_files:
 if email_files:
     add_to_docs(email_files, st.session_state.email_docs, "email")
 
+
+# ---------------------------
+# Unique counters (no creep)
+# ---------------------------
 colA, colB = st.columns(2)
 with colA:
-    if st.session_state.policy_docs:
-        st.success(f"Policy docs loaded: {len(st.session_state.policy_docs)}")
+    if st.session_state.policy_loaded_hashes:
+        st.success(f"Policy docs loaded: {len(st.session_state.policy_loaded_hashes)}")
 with colB:
-    if st.session_state.email_docs:
-        st.success(f"Prior response docs loaded: {len(st.session_state.email_docs)}")
+    if st.session_state.email_loaded_hashes:
+        st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
 
 
 # ---------------------------
@@ -212,7 +349,7 @@ if st.button("🔧 Build / Rebuild Indexes"):
 
 
 # ---------------------------
-# Prompts (strict JSON judge)
+# Prompts (strict JSON judge; braces escaped)
 # ---------------------------
 DRAFT_PROMPT = """You are a compliance assistant drafting replies to financial regulators.
 ONLY use the EVIDENCE provided. If evidence is insufficient or conflicting, state this clearly.
@@ -237,7 +374,7 @@ Rules:
 - Return ONLY a single JSON object. No commentary, no markdown, no code fences.
 - JSON must be minified on one line.
 - Use these exact keys: source_type, confidence, keep_citations.
-- source_type ∈ {"Policy","PriorEmail","Blended","Insufficient"}.
+- source_type ∈ {{"Policy","PriorEmail","Blended","Insufficient"}}.
 - confidence is a float 0.0–1.0 (use one decimal place).
 - keep_citations is an array of strings; each string must exactly match a citation tag from Evidence.
 
@@ -250,7 +387,7 @@ Evidence:
 {evidence}
 
 Return:
-{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}
+{{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}}
 """
 
 
@@ -321,26 +458,33 @@ def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
         out += r.retrieve(q)
     return out
 
-def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float]]:
+def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
     """
     Returns:
       evidence_text: str
       tag_to_file: {tag -> filename}
       tag_to_score: {tag -> similarity_score}
+      tag_to_page: {tag -> page_number or None}
     """
-    lines, tag_to_file, tag_to_score = [], {}, {}
+    lines, tag_to_file, tag_to_score, tag_to_page = [], {}, {}, {}
     for i, nws in enumerate(nodes_ws):
         node = nws.node
         src = (node.metadata or {}).get("source", "unknown")
-        tag = f"[Doc: {src}, Node {i}]"
+        page = (node.metadata or {}).get("page")  # int or None
+        # Include Page in the tag if available
+        if page is not None:
+            tag = f"[Doc: {src}, Page {page}, Node {i}]"
+        else:
+            tag = f"[Doc: {src}, Node {i}]"
         text = re.sub(r"\s+", " ", node.get_text()).strip()
         lines.append(f"{tag} {text}")
         tag_to_file[tag] = src
+        tag_to_page[tag] = page
         try:
             tag_to_score[tag] = float(nws.score or 0.0)
         except Exception:
             tag_to_score[tag] = 0.0
-    return "\n".join(lines), tag_to_file, tag_to_score
+    return "\n".join(lines), tag_to_file, tag_to_score, tag_to_page
 
 
 # ---------------------------
@@ -382,14 +526,21 @@ if st.button("🧠 Generate Responses"):
         if not questions:
             st.warning("Please add at least one question.")
         else:
-            for q in questions:
-                with st.expander(f"❓ {q}", expanded=False):
-                    # Retrieve (with scores)
+            # Collect results first; render after to avoid UI flicker
+            results = []
+
+            # Global loader/status while we work
+            with st.status("Generating responses…", state="running", expanded=True) as status:
+                total = len(questions)
+                for idx, q in enumerate(questions, start=1):
+                    status.write(f"Processing **{q}** ({idx}/{total})")
+
+                    # Retrieve (with scores + pages)
                     nodes_ws = retrieve_across(q, top_k)
                     if nodes_ws:
-                        ev_str, tag2file, tag2score = nodes_to_evidence(nodes_ws)
+                        ev_str, tag2file, tag2score, tag2page = nodes_to_evidence(nodes_ws)
                     else:
-                        ev_str, tag2file, tag2score = "(no evidence found)", {}, {}
+                        ev_str, tag2file, tag2score, tag2page = "(no evidence found)", {}, {}, {}
 
                     # Draft
                     draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
@@ -426,34 +577,98 @@ if st.button("🧠 Generate Responses"):
                         else:
                             for line in lines[:4]:
                                 ev_snips.append(line)
-                                m = re.search(r"\[Doc: (.*?), Node \d+\]", line)
+                                m = re.search(r"\[Doc: (.*?)(?:, Page \d+)?, Node \d+\]", line)
                                 if m:
                                     kept_docs.append(m.group(1))
                     kept_docs = list(dict.fromkeys(kept_docs))[:5]
 
-                    # Render UI
+                    results.append({
+                        "question": q,
+                        "draft": draft,
+                        "source_type": source_type,
+                        "confidence": round(confidence, 3),
+                        "kept_docs": kept_docs,
+                        "ev_snips": ev_snips[:6],
+                        "judge_raw": judge_raw,
+                        "tag2file": tag2file,
+                        "tag2page": tag2page,
+                    })
+
+                status.update(label="Responses generated", state="complete", expanded=False)
+
+            # ---- Render AFTER work completes ----
+            for r in results:
+                with st.expander(f"❓ {r['question']}", expanded=False):
                     left, right = st.columns([2, 1])
                     with left:
                         st.subheader("Suggested Response")
-                        st.write(draft)
+                        st.write(r["draft"])
                     with right:
                         st.subheader("Assessment")
-                        st.write(f"**Source Type:** {source_type}")
-                        st.write(f"**Confidence:** {round(confidence, 3)}")
+                        st.write(f"**Source Type:** {r['source_type']}")
+                        st.write(f"**Confidence:** {r['confidence']}")
                         st.write("**Source Docs:**")
-                        if kept_docs:
-                            for d in kept_docs:
+                        if r["kept_docs"]:
+                            for d in r["kept_docs"]:
                                 st.write(f"- {d}")
                         else:
                             st.write("- (none)")
 
                     st.subheader("Evidence Snippets")
-                    if ev_snips:
-                        for sn in ev_snips[:6]:
+                    if r["ev_snips"]:
+                        for sn in r["ev_snips"]:
                             st.code(sn, language="text")
+
+                            # ---- Inline previewer per snippet (uses your existing preview logic) ----
+                            tag = sn.split("]")[0] + "]"
+                            fname = r["tag2file"].get(tag)
+                            page = r["tag2page"].get(tag)
+                            query_text = sn[len(tag):].strip()
+                            if len(query_text) > 500:
+                                query_text = query_text[:500]
+
+                            with st.expander("Show evidence"):
+                                if fname and page and fname in st.session_state.file_bytes_map:
+                                    file_bytes = st.session_state.file_bytes_map[fname]
+                                    img = render_pdf_page_with_highlight(file_bytes, page, query_text)
+                                    if img is not None:
+                                        st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
+                                    else:
+                                        page_text = ""
+                                        if fname in st.session_state.pdf_page_texts:
+                                            page_text = st.session_state.pdf_page_texts[fname].get(page, "")
+                                        if page_text:
+                                            safe_html = highlight_html(page_text, query_text, window=600)
+                                            st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
+                                            st.markdown(safe_html, unsafe_allow_html=True)
+                                        else:
+                                            st.info("Preview unavailable for this PDF page.")
+                                else:
+                                    src_file = fname or "(unknown)"
+                                    data = st.session_state.file_bytes_map.get(src_file)
+                                    preview_text = ""
+                                    if data:
+                                        lower = src_file.lower()
+                                        try:
+                                            if lower.endswith(".pdf"):
+                                                if src_file in st.session_state.pdf_page_texts:
+                                                    preview_text = " ".join(st.session_state.pdf_page_texts[src_file].values())
+                                            elif lower.endswith(".docx"):
+                                                preview_text = read_docx(data)
+                                            elif lower.endswith(".txt"):
+                                                preview_text = read_txt(data)
+                                        except Exception:
+                                            preview_text = ""
+                                    if preview_text:
+                                        safe_html = highlight_html(preview_text, query_text, window=600)
+                                        st.markdown(f"**{src_file} (text preview)**")
+                                        st.markdown(safe_html, unsafe_allow_html=True)
+                                    else:
+                                        st.info("Preview unavailable for this evidence.")
+
                     else:
                         st.write("_No supporting evidence found._")
 
                     if show_debug:
                         st.subheader("Debug: Judge Raw Output")
-                        st.code(judge_raw[:4000], language="json")
+                        st.code(r["judge_raw"][:4000], language="json")
