@@ -46,6 +46,9 @@ from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import NodeWithScore
 
+from llama_index.core import StorageContext
+from llama_index.core.vector_stores import SimpleVectorStore
+
 
 # ---------------------------
 # Page / Header
@@ -71,6 +74,8 @@ with st.sidebar:
     temperature = st.slider("Draft temperature", 0.0, 1.0, 0.2, 0.1)
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
+
+    embed_batch_size = st.sidebar.slider("Embed batch size (pages per batch)", 4, 64, 16, 4)
 
     st.markdown("---")
     # Show whether visual preview is available
@@ -335,26 +340,66 @@ with colB:
     if st.session_state.email_loaded_hashes:
         st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
 
+def build_index_incremental(docs: List[Document], label: str, batch_size: int) -> VectorStoreIndex:
+    """
+    Build a VectorStoreIndex by embedding Documents in small batches (page-by-page).
+    Shows a status panel + progress bar while embedding.
+    """
+    storage_context = StorageContext.from_defaults(vector_store=SimpleVectorStore())
+    index = VectorStoreIndex([], storage_context=storage_context)
+
+    total = len(docs)
+    if total == 0:
+        return index
+
+    with st.status(f"Embedding {label} ({total} pages)…", state="running", expanded=True) as status:
+        pb = st.progress(0.0)
+        made = 0
+        for i in range(0, total, batch_size):
+            batch = docs[i : i + batch_size]
+            # Convert Documents -> Nodes with your configured node parser (keeps metadata like Page)
+            nodes = Settings.node_parser.get_nodes_from_documents(batch)
+            # Insert nodes into the shared vector store (aggregating as we go)
+            index.insert_nodes(nodes)
+
+            made += len(batch)
+            pb.progress(min(1.0, made / total))
+            status.write(f"Embedded {made}/{total}")
+
+        status.update(label=f"{label} embedded", state="complete", expanded=False)
+
+    return index
+
 
 # ---------------------------
 # Build / Rebuild Indexes
 # ---------------------------
 if st.button("🔧 Build / Rebuild Indexes"):
+    # Guard
     if not st.session_state.policy_docs and not st.session_state.email_docs:
         st.error("Please upload at least one document.")
     else:
-        with st.spinner("Building LlamaIndex vector indexes..."):
+        with st.spinner("Preparing to build indexes…"):
             configure_settings()
-            st.session_state.policy_index = (
-                VectorStoreIndex.from_documents(st.session_state.policy_docs)
-                if st.session_state.policy_docs else None
+
+        # Build incrementally with loaders and progress
+        if st.session_state.policy_docs:
+            st.session_state.policy_index = build_index_incremental(
+                st.session_state.policy_docs, label="Policy corpus", batch_size=embed_batch_size
             )
-            st.session_state.email_index = (
-                VectorStoreIndex.from_documents(st.session_state.email_docs)
-                if st.session_state.email_docs else None
+        else:
+            st.session_state.policy_index = None
+
+        if st.session_state.email_docs:
+            st.session_state.email_index = build_index_incremental(
+                st.session_state.email_docs, label="Prior responses corpus", batch_size=embed_batch_size
             )
-            st.session_state.vector_ready = True
+        else:
+            st.session_state.email_index = None
+
+        st.session_state.vector_ready = True
         st.success("Indexes built.")
+
 
 
 # ---------------------------
