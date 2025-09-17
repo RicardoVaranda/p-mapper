@@ -16,6 +16,7 @@
 #     * Page-by-page pre-embedding with batching
 #     * SQLite embedding cache keyed by hash of token-truncated text
 #     * Configurable token truncation (to shrink payload) + API batch sizes
+# - Thread-safe SQLite usage (connection created/closed inside build function)
 
 import os
 import io
@@ -250,22 +251,29 @@ if "file_bytes_map" not in st.session_state:
 if "pdf_page_texts" not in st.session_state:
     st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
 
-# embedding cache
-def _init_embed_cache(path: str):
-    conn = sqlite3.connect(path)
-    with conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS emb_cache (
-              h TEXT PRIMARY KEY,
-              v TEXT NOT NULL
-            )
-        """)
-    return conn
-
+# embedding cache path (thread-safe handling done during build)
 if "embed_cache_path" not in st.session_state:
     st.session_state.embed_cache_path = "embed_cache.sqlite3"
-if "embed_cache_conn" not in st.session_state:
-    st.session_state.embed_cache_conn = _init_embed_cache(st.session_state.embed_cache_path)
+
+def _init_embed_cache(path: str):
+    """Create DB & table if needed, then close immediately (no long-lived connection)."""
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS emb_cache (
+                  h TEXT PRIMARY KEY,
+                  v TEXT NOT NULL
+                )
+            """)
+            # Optional pragmas for speed
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+    finally:
+        conn.close()
+
+# Ensure cache DB exists
+_init_embed_cache(st.session_state.embed_cache_path)
 
 
 # ---------------------------
@@ -390,7 +398,7 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
 
 
 # ---------------------------
-# Build indexes — pre-embedded + cached (FAST)
+# Build indexes — pre-embedded + cached (FAST) with thread-safe SQLite
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -404,6 +412,7 @@ def build_index_incremental_preembedded_cached(
     2) For each node: normalize + token-truncate + hash
     3) Pull cached embeddings by hash; embed only misses (batched)
     4) Attach embeddings to nodes; add to SimpleVectorStore
+    SQLite connection is opened/closed inside this function (thread-safe).
     """
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -413,8 +422,7 @@ def build_index_incremental_preembedded_cached(
 
     parser = Settings.node_parser
     total_pages = len(docs)
-    pages_done = 0
-    conn = st.session_state.embed_cache_conn
+    db_path = st.session_state.embed_cache_path
 
     with st.status(f"Embedding {label} ({total_pages} pages)…", state="running", expanded=True) as status:
         outer_pb = st.progress(0.0)
@@ -423,60 +431,71 @@ def build_index_incremental_preembedded_cached(
         total_hits = 0
         total_miss = 0
 
-        for i in range(0, total_pages, page_batch_size):
-            batch_docs = docs[i:i+page_batch_size]
+        # Open a fresh connection for this run/thread
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
 
-            # 1) pages -> nodes
-            nodes: List[TextNode] = parser.get_nodes_from_documents(batch_docs)
+            for i in range(0, total_pages, page_batch_size):
+                batch_docs = docs[i:i+page_batch_size]
 
-            # 2) normalize + truncate + hash
-            texts: List[str] = []
-            hashes: List[str] = []
-            for n in nodes:
-                raw = n.get_content(metadata_mode="none")
-                norm = _normalize_for_hash(raw)
-                trunc = _truncate_to_tokens(norm, max_tokens=max_tokens)
-                texts.append(trunc)
-                hashes.append(_sha(trunc))
+                # 1) pages -> nodes
+                nodes: List[TextNode] = parser.get_nodes_from_documents(batch_docs)
 
-            # 3) cache lookup
-            cache_map = _cache_get_many(conn, hashes)
-            hits = sum(1 for h in hashes if h in cache_map)
-            miss_idx = [idx for idx, h in enumerate(hashes) if h not in cache_map]
-            miss_texts = [texts[idx] for idx in miss_idx]
+                # 2) normalize + truncate + hash
+                texts: List[str] = []
+                hashes: List[str] = []
+                for n in nodes:
+                    raw = n.get_content(metadata_mode="none")
+                    norm = _normalize_for_hash(raw)
+                    trunc = _truncate_to_tokens(norm, max_tokens=max_tokens)
+                    texts.append(trunc)
+                    hashes.append(_sha(trunc))
 
-            # embed misses in API sub-batches
-            new_items: Dict[str, List[float]] = {}
-            if miss_texts:
-                t0 = time.time()
-                for j in range(0, len(miss_texts), api_batch_size):
-                    sub = miss_texts[j:j+api_batch_size]
-                    embs = Settings.embed_model.get_text_embedding_batch(sub)
-                    for k, e in enumerate(embs):
-                        new_items[hashes[miss_idx[j+k]]] = e
-                _cache_set_many(conn, new_items)
-                dt = time.time() - t0
-                status.write(f"• Embedded {len(miss_texts)} new nodes in {dt:.1f}s ({dt/max(1,len(miss_texts)):.2f}s/item)")
-            else:
-                status.write("• All nodes from this batch served from cache")
+                # 3) cache lookup
+                cache_map = _cache_get_many(conn, hashes)
+                hits = sum(1 for h in hashes if h in cache_map)
+                miss_idx = [idx for idx, h in enumerate(hashes) if h not in cache_map]
+                miss_texts = [texts[idx] for idx in miss_idx]
 
-            # 4) attach embeddings and add to vector store
-            for n, h in zip(nodes, hashes):
-                vec = cache_map.get(h) or new_items.get(h)
-                n.embedding = vec  # prevents re-embedding
-            vector_store.add(nodes)
+                # embed misses in API sub-batches
+                new_items: Dict[str, List[float]] = {}
+                if miss_texts:
+                    t0 = time.time()
+                    for j in range(0, len(miss_texts), api_batch_size):
+                        sub = miss_texts[j:j+api_batch_size]
+                        embs = Settings.embed_model.get_text_embedding_batch(sub)
+                        for k, e in enumerate(embs):
+                            new_items[hashes[miss_idx[j+k]]] = e
+                    _cache_set_many(conn, new_items)
+                    dt = time.time() - t0
+                    status.write(f"• Embedded {len(miss_texts)} new nodes in {dt:.1f}s ({dt/max(1,len(miss_texts)):.2f}s/item)")
+                else:
+                    status.write("• All nodes from this batch served from cache")
 
-            total_nodes += len(nodes)
-            total_hits  += hits
-            total_miss  += len(miss_texts)
+                # 4) attach embeddings and add to vector store
+                for n, h in zip(nodes, hashes):
+                    vec = cache_map.get(h) or new_items.get(h)
+                    n.embedding = vec  # prevents re-embedding
+                vector_store.add(nodes)
 
-            pages_done += len(batch_docs)
-            outer_pb.progress(min(1.0, pages_done / total_pages))
-            status.write(f"Progress: pages {pages_done}/{total_pages} | nodes: {total_nodes} | cache hits: {total_hits} | misses: {total_miss}")
+                total_nodes += len(nodes)
+                total_hits  += hits
+                total_miss  += len(miss_texts)
+
+                pages_done = min(total_pages, i + len(batch_docs))
+                outer_pb.progress(min(1.0, pages_done / total_pages))
+                status.write(f"Progress: pages {pages_done}/{total_pages} | nodes: {total_nodes} | cache hits: {total_hits} | misses: {total_miss}")
+        finally:
+            conn.close()
 
         dt_all = time.time() - t0_all
-        status.update(label=f"{label} embedded — nodes: {total_nodes}, hits: {total_hits}, misses: {total_miss}, time: {dt_all:.1f}s",
-                      state="complete", expanded=False)
+        status.update(
+            label=f"{label} embedded — nodes: {total_nodes}, hits: {total_hits}, misses: {total_miss}, time: {dt_all:.1f}s",
+            state="complete",
+            expanded=False
+        )
 
     return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
@@ -633,9 +652,11 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
       tag_to_score: {tag -> similarity_score}
       tag_to_page: {tag -> page_number or None}
     """
-    lines, tag_to_file, tag_to_score, tag_to_page = {}, {}, {}, {}
-    # Keep order for display
     evidence_lines: List[str] = []
+    tag_to_file: Dict[str, str] = {}
+    tag_to_score: Dict[str, float] = {}
+    tag_to_page: Dict[str, Optional[int]] = {}
+
     for i, nws in enumerate(nodes_ws):
         node = nws.node
         src = (node.metadata or {}).get("source", "unknown")
@@ -652,6 +673,7 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
             tag_to_score[tag] = float(nws.score or 0.0)
         except Exception:
             tag_to_score[tag] = 0.0
+
     return "\n".join(evidence_lines), tag_to_file, tag_to_score, tag_to_page
 
 
