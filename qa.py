@@ -39,6 +39,8 @@ from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import SimpleVectorStore
+from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.vector_stores.types import VectorStoreQuery
 
 # ---------------------------
 # Page / Header
@@ -69,9 +71,9 @@ with st.sidebar:
     embed_max_tokens = st.slider("Embedding max tokens per node", 256, 4096, 768, 64)
 
     # Toggle-only debugger (persisted; used inside build function)
-    embed_debug = st.toggle("Enable embedding debugger", value=False, key="embed_debug")
+    st.toggle("Enable embedding debugger", value=False, key="embed_debug")
 
-    show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
+    st.toggle("Show Judge Raw Output (debug)", value=False, key="show_debug")
 
     st.markdown("---")
     if fitz and Image and ImageDraw:
@@ -377,8 +379,10 @@ def build_index_incremental_preembedded_cached(
       - Cache hits/misses + optional per-batch debug timings
       - Store nodes in DOCSTORE first, then vector store (prevents KeyError)
     """
+    # Prepare explicit docstore + vector store
+    docstore = SimpleDocumentStore()
     vector_store = SimpleVectorStore()
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    storage_context = StorageContext.from_defaults(docstore=docstore, vector_store=vector_store)
     if not docs:
         return VectorStoreIndex([], storage_context=storage_context)
 
@@ -649,7 +653,7 @@ def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str])
     return round(max(0.05, min(0.99, avg)), 3)
 
 # ---------------------------
-# Resilient retrieval with auto-repair
+# Resilient retrieval with direct-query fallback + auto-repair
 # ---------------------------
 def _repair_index(kind: str) -> Optional[VectorStoreIndex]:
     """Rebuild a single index (policy|email) from loaded docs, using cached embeddings."""
@@ -677,26 +681,53 @@ def _repair_index(kind: str) -> Optional[VectorStoreIndex]:
         return idx
     return None
 
-def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
-    out: List[NodeWithScore] = []
+def _direct_query_nodes(index: VectorStoreIndex, q: str, k: int) -> List[NodeWithScore]:
+    """Query the vector store directly and safely build NodeWithScore list, skipping missing docstore IDs."""
+    try:
+        q_emb = Settings.embed_model.get_text_embedding(q)
+        vs = getattr(index, "_vector_store", None) or getattr(index, "vector_store", None)
+        ds = getattr(index, "_docstore", None) or index.storage_context.docstore
+        if vs is None or ds is None:
+            return []
+        res = vs.query(VectorStoreQuery(query_embedding=q_emb, similarity_top_k=k))
+        nodes_ws: List[NodeWithScore] = []
+        if not res or not getattr(res, "ids", None):
+            return nodes_ws
+        sims = res.similarities or [0.0] * len(res.ids)
+        for nid, score in zip(res.ids, sims):
+            node = ds.get_document(nid, raise_error=False)
+            if node is not None:
+                nodes_ws.append(NodeWithScore(node=node, score=score))
+        return nodes_ws
+    except Exception as e:
+        st.warning(f"Direct vector query failed: {e}")
+        return []
 
-    def _safe_retrieve(idx: Optional[VectorStoreIndex], kind: str) -> List[NodeWithScore]:
-        if not idx:
+def _safe_retrieve_with_fallback(index: Optional[VectorStoreIndex], kind: str, q: str, k: int) -> List[NodeWithScore]:
+    """Try standard retriever; on KeyError use direct-query fallback; if still empty, repair index and retry."""
+    if not index:
+        return []
+    try:
+        r = VectorIndexRetriever(index=index, similarity_top_k=k)
+        return r.retrieve(q)
+    except KeyError:
+        nodes = _direct_query_nodes(index, q, k)
+        if nodes:
+            return nodes
+        idx2 = _repair_index(kind)
+        if not idx2:
+            st.warning(f"Unable to repair {kind} index (no docs).")
             return []
         try:
-            r = VectorIndexRetriever(index=idx, similarity_top_k=k)
-            return r.retrieve(q)
-        except KeyError:
-            # Docstore/vector store out of sync — rebuild this index once and retry
-            idx2 = _repair_index(kind)
-            if not idx2:
-                st.warning(f"Unable to repair {kind} index (no docs).")
-                return []
             r2 = VectorIndexRetriever(index=idx2, similarity_top_k=k)
             return r2.retrieve(q)
+        except KeyError:
+            return _direct_query_nodes(idx2, q, k)
 
-    out += _safe_retrieve(st.session_state.policy_index, "policy")
-    out += _safe_retrieve(st.session_state.email_index, "email")
+def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
+    out: List[NodeWithScore] = []
+    out += _safe_retrieve_with_fallback(st.session_state.policy_index, "policy", q, k)
+    out += _safe_retrieve_with_fallback(st.session_state.email_index,  "email",  q, k)
     return out
 
 def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
@@ -743,6 +774,11 @@ q_table = st.data_editor(
     key="q_editor",
     column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
 )
+
+# ---------------------------
+# Build / Rebuild Indexes button (manual)
+# ---------------------------
+# (Already defined above; left in place for explicit rebuilds)
 
 # ---------------------------
 # Generate Responses (lazy-build if needed)
@@ -829,6 +865,8 @@ if st.button("🧠 Generate Responses"):
 
             status.update(label="Responses generated", state="complete", expanded=False)
 
+        show_debug = st.session_state.get("show_debug", False)
+
         for r in results:
             with st.expander(f"❓ {r['question']}", expanded=False):
                 left, right = st.columns([2, 1])
@@ -870,7 +908,7 @@ if st.button("🧠 Generate Responses"):
                                     if page_text:
                                         safe_html = highlight_html(page_text, query_text, window=600)
                                         st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
-                                        st.markdown(safe_allow_html=True)
+                                        st.markdown(safe_html, unsafe_allow_html=True)
                                     else:
                                         st.info("Preview unavailable for this PDF page.")
                             else:
