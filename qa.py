@@ -3,24 +3,27 @@
 # Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
 # Dynamically add questions (textarea or table)
 # Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
-# Updates included:
-#   - Strict JSON-only judge prompt (escaped braces)
-#   - Robust JSON extraction
-#   - Fallback inference for source_type + confidence
-#   - SHA-256 fingerprint dedupe for uploaded files
-#   - Accurate counters based on unique file hashes
-#   - "Clear loaded docs" reset button
-#   - Evidence previewer:
-#       * Always: text-page preview with <mark> highlight
-#       * Optional: PDF page image preview with highlight if pymupdf + Pillow available
+#
+# Includes:
+# - Strict JSON-only judge prompt (escaped braces)
+# - Robust JSON extraction
+# - Fallback inference for source_type + confidence
+# - SHA-256 fingerprint dedupe for uploaded files
+# - Accurate counters based on unique file hashes
+# - "Clear loaded docs" reset button
+# - Evidence previewer (PDF page text or image with highlight if pymupdf+Pillow present)
+# - Global loader for Generate Responses
+# - Incremental, page-by-page embedding with progress + verbose timing debug
 
 import os
 import io
 import re
 import json
+import time
 import hashlib
+import traceback
 from typing import List, Tuple, Dict, Optional
-from html import escape 
+from html import escape  # for safe HTML preview
 
 import streamlit as st
 import docx2txt
@@ -39,14 +42,12 @@ except Exception:
     ImageDraw = None
 
 # ---- LlamaIndex (<=0.12.53) ----
-from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.core import VectorStoreIndex, Document, Settings, StorageContext
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import NodeWithScore
-
-from llama_index.core import StorageContext
 from llama_index.core.vector_stores import SimpleVectorStore
 
 
@@ -74,11 +75,12 @@ with st.sidebar:
     temperature = st.slider("Draft temperature", 0.0, 1.0, 0.2, 0.1)
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
+    verbose_debug = st.toggle("Verbose debug (timings & traces)", value=False)
 
-    embed_batch_size = st.sidebar.slider("Embed batch size (pages per batch)", 4, 64, 16, 4)
+    embed_batch_size = st.slider("Embed batch size (pages per batch)", 4, 64, 16, 4)
+    st.session_state.embed_batch_size = embed_batch_size
 
     st.markdown("---")
-    # Show whether visual preview is available
     if fitz and Image and ImageDraw:
         st.info("PDF visual preview: **Enabled** (pymupdf + Pillow detected)")
     else:
@@ -184,7 +186,6 @@ def highlight_html(text: str, needle: str, window: int = 400) -> str:
 
     return f"<pre>{before}<mark>{match}</mark>{after}</pre>"
 
-
 def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text: str):
     """Render a PDF page image and draw highlight rectangles for query_text (best-effort)."""
     if not (fitz and Image and ImageDraw):
@@ -193,19 +194,17 @@ def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         page = doc[page_num - 1]
-        # Try to find rectangles for a short version of the query
         q = (query_text or "").strip()
         if len(q) > 120:
             q = q[:120]
         rects = page.search_for(q) if q else []
-        # Render page to image
-        pix = page.get_pixmap(dpi=144)  # reasonably crisp
+        pix = page.get_pixmap(dpi=144)
         mode = "RGBA" if pix.alpha else "RGB"
         img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
 
         if rects:
             draw = ImageDraw.Draw(img)
-            for r in rects[:5]:  # cap highlights
+            for r in rects[:5]:
                 draw.rectangle([(r.x0, r.y0), (r.x1, r.y1)], outline=(255, 0, 0), width=4)
         return img
     except Exception:
@@ -270,7 +269,6 @@ def add_to_docs(files, target_list, corpus_name: str):
         f.seek(0)
         digest = fingerprint(data)
 
-        # choose the right set for dedupe
         seen_set = (
             st.session_state.policy_loaded_hashes
             if corpus_name == "policy"
@@ -280,17 +278,15 @@ def add_to_docs(files, target_list, corpus_name: str):
         if digest in seen_set:
             continue  # already loaded in this session
 
-        # Parse based on file type
         lower = name.lower()
         if lower.endswith(".pdf"):
             pages = read_pdf_pages(data)
             if not any(txt.strip() for _, txt in pages):
                 st.warning(f"Empty/unsupported PDF: {name}")
                 continue
-            # One Document per PDF page, so we can keep page metadata
+            # One Document per PDF page (keeps 'page' metadata)
             for page_num, txt in pages:
                 target_list.append(Document(text=txt, metadata={"source": name, "page": page_num}))
-            # Store for preview
             st.session_state.file_bytes_map[name] = data
             st.session_state.pdf_page_texts[name] = {p: t for p, t in pages}
 
@@ -300,7 +296,6 @@ def add_to_docs(files, target_list, corpus_name: str):
                 st.warning(f"Empty/unsupported DOCX: {name}")
                 continue
             target_list.append(Document(text=txt, metadata={"source": name}))
-            # Optionally store for preview (text-only)
             st.session_state.file_bytes_map[name] = data
 
         elif lower.endswith(".txt"):
@@ -309,14 +304,12 @@ def add_to_docs(files, target_list, corpus_name: str):
                 st.warning(f"Empty/unsupported TXT: {name}")
                 continue
             target_list.append(Document(text=txt, metadata={"source": name}))
-            # Optionally store for preview (text-only)
             st.session_state.file_bytes_map[name] = data
 
         else:
             st.warning(f"Unsupported file type: {name}")
             continue
 
-        # mark as seen and register corpus membership
         seen_set.add(digest)
         if corpus_name == "policy":
             st.session_state.policy_files_set.add(name)
@@ -340,10 +333,30 @@ with colB:
     if st.session_state.email_loaded_hashes:
         st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
 
-def build_index_incremental(docs: List[Document], label: str, batch_size: int) -> VectorStoreIndex:
+
+# ---------------------------
+# Embedding diagnostics
+# ---------------------------
+def ping_embedder(sample_texts: list[str]) -> dict:
+    """Quick probe of the embedding service latency & throughput."""
+    try:
+        t0 = time.perf_counter()
+        vecs = Settings.embed_model.get_text_embedding_batch(sample_texts)
+        t1 = time.perf_counter()
+        return {
+            "ok": True,
+            "count": len(vecs),
+            "secs": round(t1 - t0, 3),
+            "per_item_secs": round((t1 - t0) / max(1, len(sample_texts)), 3),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[:2000]}
+
+
+def build_index_incremental(docs: List[Document], label: str, batch_size: int, verbose: bool) -> VectorStoreIndex:
     """
     Build a VectorStoreIndex by embedding Documents in small batches (page-by-page).
-    Shows a status panel + progress bar while embedding.
+    Shows timing for node parsing, embedding+insertion, and total per batch.
     """
     storage_context = StorageContext.from_defaults(vector_store=SimpleVectorStore())
     index = VectorStoreIndex([], storage_context=storage_context)
@@ -355,51 +368,82 @@ def build_index_incremental(docs: List[Document], label: str, batch_size: int) -
     with st.status(f"Embedding {label} ({total} pages)…", state="running", expanded=True) as status:
         pb = st.progress(0.0)
         made = 0
+
+        if verbose:
+            status.write("🔎 Debug: running embedder ping (3 tiny texts)…")
+            ping = ping_embedder(["alpha", "beta", "gamma"])
+            status.write(f"Embedder ping → {ping}")
+
         for i in range(0, total, batch_size):
             batch = docs[i : i + batch_size]
-            # Convert Documents -> Nodes with your configured node parser (keeps metadata like Page)
-            nodes = Settings.node_parser.get_nodes_from_documents(batch)
-            # Insert nodes into the shared vector store (aggregating as we go)
-            index.insert_nodes(nodes)
+            batch_label = f"batch {i//batch_size+1} ({len(batch)} docs) [{i+1}..{min(i+len(batch), total)}]"
 
-            made += len(batch)
-            pb.progress(min(1.0, made / total))
-            status.write(f"Embedded {made}/{total}")
+            try:
+                t0 = time.perf_counter()
+                nodes = Settings.node_parser.get_nodes_from_documents(batch)
+                t1 = time.perf_counter()
 
-        status.update(label=f"{label} embedded", state="complete", expanded=False)
+                if verbose:
+                    sample = [n.get_text()[:512] for n in nodes[:3]]
+                    ping2 = ping_embedder(sample) if sample else {"ok": True, "count": 0, "secs": 0.0}
+                    status.write(f"🔎 {batch_label} parse_secs={round(t1-t0,3)} pre_embed={ping2}")
+
+                t2 = time.perf_counter()
+                index.insert_nodes(nodes)  # triggers actual embeddings for these nodes
+                t3 = time.perf_counter()
+
+                made += len(batch)
+                pb.progress(min(1.0, made / total))
+                status.write(
+                    f"✅ {batch_label} — parse:{round(t1-t0,3)}s embed+insert:{round(t3-t2,3)}s total:{round(t3-t0,3)}s"
+                )
+            except Exception as e:
+                status.write(f"❌ {batch_label} failed: {type(e).__name__}: {e}")
+                if verbose:
+                    st.exception(e)
+
+        status.update(label=f"{label} embedded", state="complete", expanded=verbose)
 
     return index
 
 
 # ---------------------------
-# Build / Rebuild Indexes
+# Build / Rebuild Indexes (incremental)
 # ---------------------------
 if st.button("🔧 Build / Rebuild Indexes"):
-    # Guard
     if not st.session_state.policy_docs and not st.session_state.email_docs:
         st.error("Please upload at least one document.")
     else:
         with st.spinner("Preparing to build indexes…"):
             configure_settings()
+            if verbose_debug:
+                st.info({
+                    "embed_model": getattr(Settings.embed_model, "model", str(Settings.embed_model)),
+                    "chat_model": getattr(Settings.llm, "model", str(Settings.llm)),
+                    "base_url": os.getenv("OPENAI_BASE_URL", "(env not set)") or "(env empty)",
+                    "batch_size": st.session_state.get("embed_batch_size", embed_batch_size),
+                    "policy_docs": len(st.session_state.policy_docs),
+                    "email_docs": len(st.session_state.email_docs),
+                })
 
-        # Build incrementally with loaders and progress
         if st.session_state.policy_docs:
             st.session_state.policy_index = build_index_incremental(
-                st.session_state.policy_docs, label="Policy corpus", batch_size=embed_batch_size
+                st.session_state.policy_docs, label="Policy corpus",
+                batch_size=embed_batch_size, verbose=verbose_debug
             )
         else:
             st.session_state.policy_index = None
 
         if st.session_state.email_docs:
             st.session_state.email_index = build_index_incremental(
-                st.session_state.email_docs, label="Prior responses corpus", batch_size=embed_batch_size
+                st.session_state.email_docs, label="Prior responses corpus",
+                batch_size=embed_batch_size, verbose=verbose_debug
             )
         else:
             st.session_state.email_index = None
 
         st.session_state.vector_ready = True
         st.success("Indexes built.")
-
 
 
 # ---------------------------
@@ -453,20 +497,16 @@ def extract_first_json_obj(s: str) -> Optional[dict]:
     if not s:
         return None
     s_stripped = s.strip()
-    # Common case: pure JSON
     if s_stripped.startswith("{") and s_stripped.endswith("}"):
         try:
             return json.loads(s_stripped)
         except Exception:
             pass
-    # Remove code fences if present
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip(), flags=re.IGNORECASE | re.MULTILINE)
-    # Greedy search for first {...}
     m = re.search(r"\{.*\}", s, flags=re.DOTALL)
     if not m:
         return None
     block = m.group(0)
-    # Try progressively trimming to valid JSON
     for end in range(len(block), 1, -1):
         try:
             return json.loads(block[:end])
@@ -488,14 +528,12 @@ def infer_source_type_from_tags(tags: List[str], tag_to_file: Dict[str, str]) ->
     return "Insufficient"
 
 def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str]) -> float:
-    # Use kept tags if available; else use all
     use_tags = kept_tags or list(tag_to_score.keys())
     scores = [tag_to_score.get(t, 0.0) for t in use_tags]
     if not scores:
         return 0.0
     clipped = [min(1.0, max(0.0, float(s))) for s in scores]
     avg = sum(clipped) / len(clipped)
-    # Slight clamp to avoid absolute 0 or 1 in UI
     return round(max(0.05, min(0.99, avg)), 3)
 
 
@@ -524,8 +562,7 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
     for i, nws in enumerate(nodes_ws):
         node = nws.node
         src = (node.metadata or {}).get("source", "unknown")
-        page = (node.metadata or {}).get("page")  # int or None
-        # Include Page in the tag if available
+        page = (node.metadata or {}).get("page")
         if page is not None:
             tag = f"[Doc: {src}, Page {page}, Node {i}]"
         else:
@@ -561,6 +598,10 @@ q_table = st.data_editor(
     column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
 )
 
+
+# ---------------------------
+# Generate Responses (global loader + render after)
+# ---------------------------
 if st.button("🧠 Generate Responses"):
     if not st.session_state.vector_ready:
         st.error("Please build indexes first.")
@@ -568,7 +609,6 @@ if st.button("🧠 Generate Responses"):
         configure_settings()
         llm = Settings.llm
 
-        # Collate deduped questions from both inputs
         typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
         edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
         questions, seen = [], set()
@@ -580,10 +620,7 @@ if st.button("🧠 Generate Responses"):
         if not questions:
             st.warning("Please add at least one question.")
         else:
-            # Collect results first; render after to avoid UI flicker
             results = []
-
-            # Global loader/status while we work
             with st.status("Generating responses…", state="running", expanded=True) as status:
                 total = len(questions)
                 for idx, q in enumerate(questions, start=1):
@@ -673,7 +710,7 @@ if st.button("🧠 Generate Responses"):
                         for sn in r["ev_snips"]:
                             st.code(sn, language="text")
 
-                            # ---- Inline previewer per snippet (uses your existing preview logic) ----
+                            # ---- Inline previewer per snippet ----
                             tag = sn.split("]")[0] + "]"
                             fname = r["tag2file"].get(tag)
                             page = r["tag2page"].get(tag)
@@ -719,7 +756,6 @@ if st.button("🧠 Generate Responses"):
                                         st.markdown(safe_html, unsafe_allow_html=True)
                                     else:
                                         st.info("Preview unavailable for this evidence.")
-
                     else:
                         st.write("_No supporting evidence found._")
 
