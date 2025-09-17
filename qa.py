@@ -68,7 +68,7 @@ with st.sidebar:
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
     embed_max_tokens = st.slider("Embedding max tokens per node", 256, 4096, 768, 64)
 
-    # Toggle-only debugger (persisted)
+    # Toggle-only debugger (persisted; used inside build function)
     embed_debug = st.toggle("Enable embedding debugger", value=False, key="embed_debug")
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
@@ -361,7 +361,7 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return enc.decode(toks[:max_tokens])
 
 # ---------------------------
-# Build indexes — pre-embedded + cached (FAST)
+# Build indexes — pre-embedded + cached (FAST) with docstore-first write
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -375,7 +375,7 @@ def build_index_incremental_preembedded_cached(
       - Page-by-page nodes
       - Token-truncated hashing for cached embeddings
       - Cache hits/misses + optional per-batch debug timings
-      - Store nodes in BOTH vector_store and docstore
+      - Store nodes in DOCSTORE first, then vector store (prevents KeyError)
     """
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -460,12 +460,14 @@ def build_index_incremental_preembedded_cached(
                 else:
                     status.write("• All nodes from this batch served from cache")
 
+                # attach embeddings
                 for n, h in zip(nodes, hashes):
                     vec = cache_map.get(h) or new_items.get(h)
                     n.embedding = vec
 
+                # ✅ write to DOCSTORE first, then vector store (prevents KeyError on retrieve)
+                storage_context.docstore.add_documents(nodes)
                 vector_store.add(nodes)
-                storage_context.docstore.add_nodes(nodes)
 
                 total_nodes += len(nodes)
                 total_hits  += hits
@@ -517,7 +519,6 @@ def ensure_indexes_built() -> bool:
                     max_tokens=embed_max_tokens,
                 )
 
-    # vector_ready mirrors whether we actually have something to search
     st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
     return st.session_state.vector_ready
 
@@ -648,16 +649,54 @@ def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str])
     return round(max(0.05, min(0.99, avg)), 3)
 
 # ---------------------------
-# Retrieval helpers
+# Resilient retrieval with auto-repair
 # ---------------------------
+def _repair_index(kind: str) -> Optional[VectorStoreIndex]:
+    """Rebuild a single index (policy|email) from loaded docs, using cached embeddings."""
+    if kind == "policy" and st.session_state.policy_docs:
+        st.info("Repairing policy index from cache…")
+        idx = build_index_incremental_preembedded_cached(
+            st.session_state.policy_docs,
+            label="Policy corpus (repair)",
+            page_batch_size=embed_page_batch,
+            api_batch_size=embed_api_batch,
+            max_tokens=embed_max_tokens,
+        )
+        st.session_state.policy_index = idx
+        return idx
+    if kind == "email" and st.session_state.email_docs:
+        st.info("Repairing prior responses index from cache…")
+        idx = build_index_incremental_preembedded_cached(
+            st.session_state.email_docs,
+            label="Prior responses corpus (repair)",
+            page_batch_size=embed_page_batch,
+            api_batch_size=embed_api_batch,
+            max_tokens=embed_max_tokens,
+        )
+        st.session_state.email_index = idx
+        return idx
+    return None
+
 def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
     out: List[NodeWithScore] = []
-    if st.session_state.policy_index:
-        r = VectorIndexRetriever(index=st.session_state.policy_index, similarity_top_k=k)
-        out += r.retrieve(q)
-    if st.session_state.email_index:
-        r = VectorIndexRetriever(index=st.session_state.email_index, similarity_top_k=k)
-        out += r.retrieve(q)
+
+    def _safe_retrieve(idx: Optional[VectorStoreIndex], kind: str) -> List[NodeWithScore]:
+        if not idx:
+            return []
+        try:
+            r = VectorIndexRetriever(index=idx, similarity_top_k=k)
+            return r.retrieve(q)
+        except KeyError:
+            # Docstore/vector store out of sync — rebuild this index once and retry
+            idx2 = _repair_index(kind)
+            if not idx2:
+                st.warning(f"Unable to repair {kind} index (no docs).")
+                return []
+            r2 = VectorIndexRetriever(index=idx2, similarity_top_k=k)
+            return r2.retrieve(q)
+
+    out += _safe_retrieve(st.session_state.policy_index, "policy")
+    out += _safe_retrieve(st.session_state.email_index, "email")
     return out
 
 def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
@@ -709,7 +748,6 @@ q_table = st.data_editor(
 # Generate Responses (lazy-build if needed)
 # ---------------------------
 if st.button("🧠 Generate Responses"):
-    # Ensure we have indexes; if not, try to build from loaded docs.
     ready = ensure_indexes_built()
     if not ready:
         st.error("No indexes available. Upload documents and build indexes first (or re-upload so I can rebuild from cache).")
@@ -832,7 +870,7 @@ if st.button("🧠 Generate Responses"):
                                     if page_text:
                                         safe_html = highlight_html(page_text, query_text, window=600)
                                         st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
-                                        st.markdown(safe_html, unsafe_allow_html=True)
+                                        st.markdown(safe_allow_html=True)
                                     else:
                                         st.info("Preview unavailable for this PDF page.")
                             else:
