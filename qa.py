@@ -3,21 +3,6 @@
 # Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
 # Dynamically add questions (textarea or table)
 # Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
-#
-# Features:
-# - Strict JSON-only judge prompt + robust JSON extractor
-# - Fallback inference for source_type + confidence when judge JSON is messy
-# - SHA-256 fingerprint dedupe for uploaded files + accurate counters
-# - "Clear loaded docs" reset button
-# - Evidence previewer (PDF page image highlighting if PyMuPDF + Pillow; else text preview with <mark>)
-# - Generate Responses uses a global loader with progress
-# - FAST indexing:
-#     * One Document per PDF page (keeps page metadata)
-#     * Page-by-page pre-embedding with batching
-#     * SQLite embedding cache keyed by hash of token-truncated text
-#     * Configurable token truncation + API batch sizes
-# - Thread-safe SQLite usage (connection created/closed inside build function)
-# - Embedding debugger: sidebar toggle; debug runs INSIDE the build-index function
 
 import os
 import io
@@ -26,7 +11,7 @@ import json
 import time
 import sqlite3
 import hashlib
-from html import escape  # for safe HTML in text preview
+from html import escape
 from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
@@ -55,14 +40,12 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import SimpleVectorStore
 
-
 # ---------------------------
 # Page / Header
 # ---------------------------
 st.set_page_config(page_title="Regulatory Response Assistant", layout="wide")
 st.title("📄 Regulatory Response Assistant (LlamaIndex)")
 st.caption("Upload policy docs + prior regulator responses → Ask regulator questions → Get evidence-backed drafts with citations.")
-
 
 # ---------------------------
 # Sidebar: Settings
@@ -85,7 +68,7 @@ with st.sidebar:
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
     embed_max_tokens = st.slider("Embedding max tokens per node", 256, 4096, 768, 64)
 
-    # Toggle-only debugger (persisted in session; used inside build function)
+    # Toggle-only debugger (persisted)
     embed_debug = st.toggle("Enable embedding debugger", value=False, key="embed_debug")
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
@@ -112,7 +95,6 @@ with st.sidebar:
         st.session_state.vector_ready = False
         st.success("Cleared all loaded documents and indexes.")
 
-
 # ---------------------------
 # Configure LlamaIndex defaults
 # ---------------------------
@@ -136,12 +118,10 @@ def configure_settings():
 
 configure_settings()
 
-
 # ---------------------------
 # File readers & PDF helpers
 # ---------------------------
 def read_pdf_pages(file_bytes: bytes) -> List[Tuple[int, str]]:
-    """Return list of (1-based page_number, text) for a PDF."""
     reader = PdfReader(io.BytesIO(file_bytes))
     out = []
     for i, p in enumerate(reader.pages):
@@ -170,10 +150,6 @@ def fingerprint_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 def highlight_html(text: str, needle: str, window: int = 400) -> str:
-    """
-    Text-based fallback preview: returns a small HTML slice around the first occurrence of needle,
-    with <mark>...</mark> highlighting. If needle not found, returns a truncated preview.
-    """
     text_norm = re.sub(r"\s+", " ", text or "")
     n = (needle or "").strip()
 
@@ -196,9 +172,8 @@ def highlight_html(text: str, needle: str, window: int = 400) -> str:
     return f"<pre>{before}<mark>{match}</mark>{after}</pre>"
 
 def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text: str):
-    """Render a PDF page image and draw highlight rectangles for query_text (best-effort)."""
     if not (fitz and Image and ImageDraw):
-        return None  # visual backend not available
+        return None
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         page = doc[page_num - 1]
@@ -211,12 +186,11 @@ def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text:
         img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
         if rects:
             draw = ImageDraw.Draw(img)
-            for r in rects[:5]:  # cap highlights
+            for r in rects[:5]:
                 draw.rectangle([(r.x0, r.y0), (r.x1, r.y1)], outline=(255, 0, 0), width=4)
         return img
     except Exception:
         return None
-
 
 # ---------------------------
 # Session state
@@ -234,32 +208,25 @@ if "email_index" not in st.session_state:
 if "vector_ready" not in st.session_state:
     st.session_state.vector_ready = False
 
-# sets to identify which filenames belong to which corpus (used for fallback)
 if "policy_files_set" not in st.session_state:
     st.session_state.policy_files_set = set()
 if "email_files_set" not in st.session_state:
     st.session_state.email_files_set = set()
 
-# sets of file hashes to dedupe uploads across reruns
 if "policy_loaded_hashes" not in st.session_state:
     st.session_state.policy_loaded_hashes = set()
 if "email_loaded_hashes" not in st.session_state:
     st.session_state.email_loaded_hashes = set()
 
-# map of filename -> raw bytes (for previews)
 if "file_bytes_map" not in st.session_state:
     st.session_state.file_bytes_map: Dict[str, bytes] = {}
-
-# PDF page text cache: filename -> {page_num: text}
 if "pdf_page_texts" not in st.session_state:
     st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
 
-# embedding cache path (thread-safe handling done during build)
 if "embed_cache_path" not in st.session_state:
     st.session_state.embed_cache_path = "embed_cache.sqlite3"
 
 def _init_embed_cache(path: str):
-    """Create DB & table if needed, then close immediately (no long-lived connection)."""
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         with conn:
@@ -269,15 +236,12 @@ def _init_embed_cache(path: str):
                   v TEXT NOT NULL
                 )
             """)
-            # Optional pragmas for speed
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
     finally:
         conn.close()
 
-# Ensure cache DB exists
 _init_embed_cache(st.session_state.embed_cache_path)
-
 
 # ---------------------------
 # Uploaders
@@ -300,14 +264,13 @@ def add_to_docs(files, target_list, corpus_name: str):
         f.seek(0)
         digest = fingerprint_bytes(data)
 
-        # choose the right set for dedupe
         seen_set = (
             st.session_state.policy_loaded_hashes
             if corpus_name == "policy"
             else st.session_state.email_loaded_hashes
         )
         if digest in seen_set:
-            continue  # already loaded this exact file in this session
+            continue
 
         lower = name.lower()
         if lower.endswith(".pdf"):
@@ -315,7 +278,6 @@ def add_to_docs(files, target_list, corpus_name: str):
             if not any(txt.strip() for _, txt in pages):
                 st.warning(f"Empty/unsupported PDF: {name}")
                 continue
-            # One Document per PDF page, so we can keep page metadata
             for page_num, txt in pages:
                 target_list.append(Document(text=txt, metadata={"source": name, "page": page_num}))
             st.session_state.file_bytes_map[name] = data
@@ -349,7 +311,6 @@ if policy_files:
 if email_files:
     add_to_docs(email_files, st.session_state.email_docs, "email")
 
-
 # ---------------------------
 # Unique counters (no creep)
 # ---------------------------
@@ -360,7 +321,6 @@ with colA:
 with colB:
     if st.session_state.email_loaded_hashes:
         st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
-
 
 # ---------------------------
 # Embedding cache helpers
@@ -400,9 +360,8 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
         return text
     return enc.decode(toks[:max_tokens])
 
-
 # ---------------------------
-# Build indexes — pre-embedded + cached (FAST) with thread-safe SQLite
+# Build indexes — pre-embedded + cached (FAST)
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -412,24 +371,17 @@ def build_index_incremental_preembedded_cached(
     max_tokens: int,
 ) -> VectorStoreIndex:
     """
-    1) Pages -> nodes (keeps page metadata)
-    2) For each node: normalize + token-truncate + hash
-    3) Pull cached embeddings by hash; embed only misses (batched)
-    4) Attach embeddings to nodes; add to BOTH SimpleVectorStore AND docstore
-    5) Return a VectorStoreIndex bound to the same storage_context (no from_vector_store)
-
-    If sidebar toggle 'Enable embedding debugger' is ON:
-      - Baseline ping before starting (synthetic payload)
-      - Per-batch timing logs for cache misses
-      - Summary at the end
+    Build a VectorStoreIndex from documents:
+      - Page-by-page nodes
+      - Token-truncated hashing for cached embeddings
+      - Cache hits/misses + optional per-batch debug timings
+      - Store nodes in BOTH vector_store and docstore
     """
-    # Prepare shared storage (vector store + docstore)
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     if not docs:
         return VectorStoreIndex([], storage_context=storage_context)
 
-    # Helpers
     def _dummy_text(tokens: int = 256) -> str:
         base = ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 80).strip()
         return _truncate_to_tokens(base, tokens)
@@ -438,7 +390,6 @@ def build_index_incremental_preembedded_cached(
     total_pages = len(docs)
     db_path = st.session_state.embed_cache_path
 
-    # Debugger defaults
     DBG_PING_BATCHES = 3
     DBG_PING_BATCH_SIZE = 16
     DBG_PING_TOKENS = 256
@@ -448,7 +399,6 @@ def build_index_incremental_preembedded_cached(
         t0_all = time.time()
         total_nodes = total_hits = total_miss = 0
 
-        # Optional: baseline ping
         if st.session_state.get("embed_debug", False):
             status.write(f"🔎 Debugger: baseline ping on {DBG_PING_BATCHES}×{DBG_PING_BATCH_SIZE} items @ ~{DBG_PING_TOKENS} tokens…")
             dummy = _dummy_text(DBG_PING_TOKENS)
@@ -464,7 +414,6 @@ def build_index_incremental_preembedded_cached(
             dt_ping_all = time.time() - t_ping_all
             status.write(f"✅ Baseline: avg/batch {sum(ping_times)/len(ping_times):.2f}s, avg/item {dt_ping_all/(DBG_PING_BATCHES*DBG_PING_BATCH_SIZE):.2f}s")
 
-        # Thread-safe SQLite connection
         conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -472,11 +421,8 @@ def build_index_incremental_preembedded_cached(
 
             for i in range(0, total_pages, page_batch_size):
                 batch_docs = docs[i:i+page_batch_size]
-
-                # 1) pages -> nodes
                 nodes: List[TextNode] = parser.get_nodes_from_documents(batch_docs)
 
-                # 2) normalize + truncate + hash
                 texts, hashes = [], []
                 for n in nodes:
                     raw = n.get_content(metadata_mode="none")
@@ -485,13 +431,11 @@ def build_index_incremental_preembedded_cached(
                     texts.append(trunc)
                     hashes.append(_sha(trunc))
 
-                # 3) cache lookup
                 cache_map = _cache_get_many(conn, hashes)
                 hits = sum(1 for h in hashes if h in cache_map)
                 miss_idx = [idx for idx, h in enumerate(hashes) if h not in cache_map]
                 miss_texts = [texts[idx] for idx in miss_idx]
 
-                # embed misses in API sub-batches
                 new_items: Dict[str, List[float]] = {}
                 if miss_texts:
                     t0 = time.time()
@@ -516,12 +460,10 @@ def build_index_incremental_preembedded_cached(
                 else:
                     status.write("• All nodes from this batch served from cache")
 
-                # 4) attach embeddings and add to BOTH vector store and docstore
                 for n, h in zip(nodes, hashes):
                     vec = cache_map.get(h) or new_items.get(h)
-                    n.embedding = vec  # prevents re-embedding
+                    n.embedding = vec
 
-                # IMPORTANT: add to vector store AND docstore so text is available for retrieval
                 vector_store.add(nodes)
                 storage_context.docstore.add_nodes(nodes)
 
@@ -545,9 +487,39 @@ def build_index_incremental_preembedded_cached(
             expanded=False
         )
 
-    # 5) Build a handle bound to this storage (no from_vector_store)
     return VectorStoreIndex([], storage_context=storage_context)
 
+# ---------------------------
+# Helper: ensure indexes exist (lazy build)
+# ---------------------------
+def ensure_indexes_built() -> bool:
+    """Build indexes if missing and docs are loaded. Return True if at least one index exists."""
+    need_policy = st.session_state.policy_index is None and bool(st.session_state.policy_docs)
+    need_email  = st.session_state.email_index  is None and bool(st.session_state.email_docs)
+
+    if need_policy or need_email:
+        with st.spinner("Building indexes on demand…"):
+            configure_settings()
+            if need_policy:
+                st.session_state.policy_index = build_index_incremental_preembedded_cached(
+                    st.session_state.policy_docs,
+                    label="Policy corpus",
+                    page_batch_size=embed_page_batch,
+                    api_batch_size=embed_api_batch,
+                    max_tokens=embed_max_tokens,
+                )
+            if need_email:
+                st.session_state.email_index = build_index_incremental_preembedded_cached(
+                    st.session_state.email_docs,
+                    label="Prior responses corpus",
+                    page_batch_size=embed_page_batch,
+                    api_batch_size=embed_api_batch,
+                    max_tokens=embed_max_tokens,
+                )
+
+    # vector_ready mirrors whether we actually have something to search
+    st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
+    return st.session_state.vector_ready
 
 # ---------------------------
 # Build / Rebuild Indexes button
@@ -581,12 +553,14 @@ if st.button("🔧 Build / Rebuild Indexes"):
         else:
             st.session_state.email_index = None
 
-        st.session_state.vector_ready = True
-        st.success("Indexes built.")
-
+        st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
+        if st.session_state.vector_ready:
+            st.success("Indexes built.")
+        else:
+            st.warning("No indexes available (no documents loaded).")
 
 # ---------------------------
-# Prompts (strict JSON judge)
+# Prompts
 # ---------------------------
 DRAFT_PROMPT = """You are a compliance assistant drafting replies to financial regulators.
 ONLY use the EVIDENCE provided. If evidence is insufficient or conflicting, state this clearly.
@@ -627,12 +601,10 @@ Return:
 {{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}}
 """
 
-
 # ---------------------------
 # Robust JSON extraction + fallback helpers
 # ---------------------------
 def extract_first_json_obj(s: str) -> Optional[dict]:
-    """Extract the first valid top-level {...} JSON object from a string."""
     if not s:
         return None
     s_stripped = s.strip()
@@ -675,9 +647,8 @@ def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str])
     avg = sum(clipped) / len(clipped)
     return round(max(0.05, min(0.99, avg)), 3)
 
-
 # ---------------------------
-# Retrieval helpers (keep NodeWithScore for fallback)
+# Retrieval helpers
 # ---------------------------
 def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
     out: List[NodeWithScore] = []
@@ -690,13 +661,6 @@ def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
     return out
 
 def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
-    """
-    Returns:
-      evidence_text: str
-      tag_to_file: {tag -> filename}
-      tag_to_score: {tag -> similarity_score}
-      tag_to_page: {tag -> page_number or None}
-    """
     evidence_lines: List[str] = []
     tag_to_file: Dict[str, str] = {}
     tag_to_score: Dict[str, float] = {}
@@ -705,7 +669,7 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
     for i, nws in enumerate(nodes_ws):
         node = nws.node
         src = (node.metadata or {}).get("source", "unknown")
-        page = (node.metadata or {}).get("page")  # int or None
+        page = (node.metadata or {}).get("page")
         if page is not None:
             tag = f"[Doc: {src}, Page {page}, Node {i}]"
         else:
@@ -721,9 +685,8 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
 
     return "\n".join(evidence_lines), tag_to_file, tag_to_score, tag_to_page
 
-
 # ---------------------------
-# Questions UI (text + dynamic editor)
+# Questions UI
 # ---------------------------
 st.markdown("### Ask Regulator Questions")
 
@@ -742,168 +705,161 @@ q_table = st.data_editor(
     column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
 )
 
-
 # ---------------------------
-# Generate Responses (global loader + progress)
+# Generate Responses (lazy-build if needed)
 # ---------------------------
 if st.button("🧠 Generate Responses"):
-    if not st.session_state.vector_ready:
-        st.error("Please build indexes first.")
+    # Ensure we have indexes; if not, try to build from loaded docs.
+    ready = ensure_indexes_built()
+    if not ready:
+        st.error("No indexes available. Upload documents and build indexes first (or re-upload so I can rebuild from cache).")
+        st.stop()
+
+    configure_settings()
+    llm = Settings.llm
+
+    typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
+    edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
+    questions, seen = [], set()
+    for q in (typed + edited):
+        if q not in seen:
+            questions.append(q)
+            seen.add(q)
+
+    if not questions:
+        st.warning("Please add at least one question.")
     else:
-        configure_settings()
-        llm = Settings.llm
+        results = []
+        with st.status("Generating responses…", state="running", expanded=True) as status:
+            total = len(questions)
+            for idx, q in enumerate(questions, start=1):
+                status.write(f"Processing **{q}** ({idx}/{total})")
 
-        # Collate deduped questions from both inputs
-        typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
-        edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
-        questions, seen = [], set()
-        for q in (typed + edited):
-            if q not in seen:
-                questions.append(q)
-                seen.add(q)
+                nodes_ws = retrieve_across(q, top_k)
+                if nodes_ws:
+                    ev_str, tag2file, tag2score, tag2page = nodes_to_evidence(nodes_ws)
+                else:
+                    ev_str, tag2file, tag2score, tag2page = "(no evidence found)", {}, {}, {}
 
-        if not questions:
-            st.warning("Please add at least one question.")
-        else:
-            results = []
-            with st.status("Generating responses…", state="running", expanded=True) as status:
-                total = len(questions)
-                for idx, q in enumerate(questions, start=1):
-                    status.write(f"Processing **{q}** ({idx}/{total})")
+                draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
 
-                    # Retrieve (with scores + pages)
-                    nodes_ws = retrieve_across(q, top_k)
-                    if nodes_ws:
-                        ev_str, tag2file, tag2score, tag2page = nodes_to_evidence(nodes_ws)
-                    else:
-                        ev_str, tag2file, tag2score, tag2page = "(no evidence found)", {}, {}, {}
+                judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
+                parsed = extract_first_json_obj(judge_raw)
 
-                    # Draft
-                    draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
+                if parsed:
+                    source_type = parsed.get("source_type", "Insufficient")
+                    keep = [str(x) for x in parsed.get("keep_citations", [])]
+                    try:
+                        confidence = float(parsed.get("confidence", 0.0))
+                    except Exception:
+                        confidence = 0.0
+                else:
+                    sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
+                    keep = [t for (t, _) in sorted_tags[:3]]
+                    source_type = infer_source_type_from_tags(keep, tag2file)
+                    confidence = confidence_from_scores(tag2score, keep)
 
-                    # Judge (robust JSON parse)
-                    judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
-                    parsed = extract_first_json_obj(judge_raw)
-
-                    if parsed:
-                        source_type = parsed.get("source_type", "Insufficient")
-                        keep = [str(x) for x in parsed.get("keep_citations", [])]
-                        try:
-                            confidence = float(parsed.get("confidence", 0.0))
-                        except Exception:
-                            confidence = 0.0
-                    else:
-                        # Fallback: pick top-3 by similarity, infer source_type & confidence
-                        sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
-                        keep = [t for (t, _) in sorted_tags[:3]]
-                        source_type = infer_source_type_from_tags(keep, tag2file)
-                        confidence = confidence_from_scores(tag2score, keep)
-
-                    # Derive kept docs + snippets
-                    ev_snips, kept_docs = [], []
-                    if ev_str != "(no evidence found)":
-                        lines = ev_str.splitlines()
-                        tag_set = set(keep) if keep else set()
-                        if tag_set:
-                            for line in lines:
-                                tag = line.split("]")[0] + "]"
-                                if tag in tag_set:
-                                    ev_snips.append(line)
-                                    kept_docs.append(tag2file.get(tag, "unknown"))
-                        else:
-                            for line in lines[:4]:
+                ev_snips, kept_docs = [], []
+                if ev_str != "(no evidence found)":
+                    lines = ev_str.splitlines()
+                    tag_set = set(keep) if keep else set()
+                    if tag_set:
+                        for line in lines:
+                            tag = line.split("]")[0] + "]"
+                            if tag in tag_set:
                                 ev_snips.append(line)
-                                m = re.search(r"\[Doc: (.*?)(?:, Page \d+)?, Node \d+\]", line)
-                                if m:
-                                    kept_docs.append(m.group(1))
-                    kept_docs = list(dict.fromkeys(kept_docs))[:5]
+                                kept_docs.append(tag2file.get(tag, "unknown"))
+                    else:
+                        for line in lines[:4]:
+                            ev_snips.append(line)
+                            m = re.search(r"\[Doc: (.*?)(?:, Page \d+)?, Node \d+\]", line)
+                            if m:
+                                kept_docs.append(m.group(1))
+                kept_docs = list(dict.fromkeys(kept_docs))[:5]
 
-                    results.append({
-                        "question": q,
-                        "draft": draft,
-                        "source_type": source_type,
-                        "confidence": round(confidence, 3),
-                        "kept_docs": kept_docs,
-                        "ev_snips": ev_snips[:6],
-                        "judge_raw": judge_raw,
-                        "tag2file": tag2file,
-                        "tag2page": tag2page,
-                    })
+                results.append({
+                    "question": q,
+                    "draft": draft,
+                    "source_type": source_type,
+                    "confidence": round(confidence, 3),
+                    "kept_docs": kept_docs,
+                    "ev_snips": ev_snips[:6],
+                    "judge_raw": judge_raw,
+                    "tag2file": tag2file,
+                    "tag2page": tag2page,
+                })
 
-                status.update(label="Responses generated", state="complete", expanded=False)
+            status.update(label="Responses generated", state="complete", expanded=False)
 
-            # ---- Render AFTER work completes ----
-            for r in results:
-                with st.expander(f"❓ {r['question']}", expanded=False):
-                    left, right = st.columns([2, 1])
-                    with left:
-                        st.subheader("Suggested Response")
-                        st.write(r["draft"])
-                    with right:
-                        st.subheader("Assessment")
-                        st.write(f"**Source Type:** {r['source_type']}")
-                        st.write(f"**Confidence:** {r['confidence']}")
-                        st.write("**Source Docs:**")
-                        if r["kept_docs"]:
-                            for d in r["kept_docs"]:
-                                st.write(f"- {d}")
-                        else:
-                            st.write("- (none)")
+        for r in results:
+            with st.expander(f"❓ {r['question']}", expanded=False):
+                left, right = st.columns([2, 1])
+                with left:
+                    st.subheader("Suggested Response")
+                    st.write(r["draft"])
+                with right:
+                    st.subheader("Assessment")
+                    st.write(f"**Source Type:** {r['source_type']}")
+                    st.write(f"**Confidence:** {r['confidence']}")
+                    st.write("**Source Docs:**")
+                    if r["kept_docs"]:
+                        for d in r["kept_docs"]:
+                            st.write(f"- {d}")
+                    else:
+                        st.write("- (none)")
 
-                    st.subheader("Evidence Snippets")
-                    if r["ev_snips"]:
-                        for sn in r["ev_snips"]:
-                            st.code(sn, language="text")
+                st.subheader("Evidence Snippets")
+                if r["ev_snips"]:
+                    for sn in r["ev_snips"]:
+                        st.code(sn, language="text")
+                        tag = sn.split("]")[0] + "]"
+                        fname = r["tag2file"].get(tag)
+                        page = r["tag2page"].get(tag)
+                        query_text = sn[len(tag):].strip()
+                        if len(query_text) > 500:
+                            query_text = query_text[:500]
 
-                            # Inline previewer per snippet
-                            tag = sn.split("]")[0] + "]"  # "[Doc: ..., Page X, Node i]"
-                            fname = r["tag2file"].get(tag)
-                            page = r["tag2page"].get(tag)
-                            query_text = sn[len(tag):].strip()
-                            if len(query_text) > 500:
-                                query_text = query_text[:500]
-
-                            with st.expander("Show evidence"):
-                                if fname and page and fname in st.session_state.file_bytes_map:
-                                    file_bytes = st.session_state.file_bytes_map[fname]
-                                    img = render_pdf_page_with_highlight(file_bytes, page, query_text)
-                                    if img is not None:
-                                        st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
-                                    else:
-                                        page_text = ""
-                                        if fname in st.session_state.pdf_page_texts:
-                                            page_text = st.session_state.pdf_page_texts[fname].get(page, "")
-                                        if page_text:
-                                            safe_html = highlight_html(page_text, query_text, window=600)
-                                            st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
-                                            st.markdown(safe_html, unsafe_allow_html=True)
-                                        else:
-                                            st.info("Preview unavailable for this PDF page.")
+                        with st.expander("Show evidence"):
+                            if fname and page and fname in st.session_state.file_bytes_map:
+                                file_bytes = st.session_state.file_bytes_map[fname]
+                                img = render_pdf_page_with_highlight(file_bytes, page, query_text)
+                                if img is not None:
+                                    st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
                                 else:
-                                    src_file = fname or "(unknown)"
-                                    data = st.session_state.file_bytes_map.get(src_file)
-                                    preview_text = ""
-                                    if data:
-                                        lower = src_file.lower()
-                                        try:
-                                            if lower.endswith(".pdf"):
-                                                if src_file in st.session_state.pdf_page_texts:
-                                                    preview_text = " ".join(st.session_state.pdf_page_texts[src_file].values())
-                                            elif lower.endswith(".docx"):
-                                                preview_text = read_docx(data)
-                                            elif lower.endswith(".txt"):
-                                                preview_text = read_txt(data)
-                                        except Exception:
-                                            preview_text = ""
-                                    if preview_text:
-                                        safe_html = highlight_html(preview_text, query_text, window=600)
-                                        st.markdown(f"**{src_file} (text preview)**")
+                                    page_text = ""
+                                    if fname in st.session_state.pdf_page_texts:
+                                        page_text = st.session_state.pdf_page_texts[fname].get(page, "")
+                                    if page_text:
+                                        safe_html = highlight_html(page_text, query_text, window=600)
+                                        st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
                                         st.markdown(safe_html, unsafe_allow_html=True)
                                     else:
-                                        st.info("Preview unavailable for this evidence.")
-                    else:
-                        st.write("_No supporting evidence found._")
+                                        st.info("Preview unavailable for this PDF page.")
+                            else:
+                                src_file = fname or "(unknown)"
+                                data = st.session_state.file_bytes_map.get(src_file)
+                                preview_text = ""
+                                if data:
+                                    lower = src_file.lower()
+                                    try:
+                                        if lower.endswith(".pdf"):
+                                            if src_file in st.session_state.pdf_page_texts:
+                                                preview_text = " ".join(st.session_state.pdf_page_texts[src_file].values())
+                                        elif lower.endswith(".docx"):
+                                            preview_text = read_docx(data)
+                                        elif lower.endswith(".txt"):
+                                            preview_text = read_txt(data)
+                                    except Exception:
+                                        preview_text = ""
+                                if preview_text:
+                                    safe_html = highlight_html(preview_text, query_text, window=600)
+                                    st.markdown(f"**{src_file} (text preview)**")
+                                    st.markdown(safe_html, unsafe_allow_html=True)
+                                else:
+                                    st.info("Preview unavailable for this evidence.")
+                else:
+                    st.write("_No supporting evidence found._")
 
-                    if show_debug:
-                        st.subheader("Debug: Judge Raw Output")
-                        st.code(r["judge_raw"][:4000], language="json")
+                if show_debug:
+                    st.subheader("Debug: Judge Raw Output")
+                    st.code(r["judge_raw"][:4000], language="json")
