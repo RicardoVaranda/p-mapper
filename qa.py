@@ -5,19 +5,19 @@
 # Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
 #
 # Features:
-# - Strict JSON-only judge prompt (escaped braces) + robust JSON extractor
+# - Strict JSON-only judge prompt + robust JSON extractor
 # - Fallback inference for source_type + confidence when judge JSON is messy
 # - SHA-256 fingerprint dedupe for uploaded files + accurate counters
 # - "Clear loaded docs" reset button
-# - Evidence previewer (PDF page image highlighting if PyMuPDF + Pillow; otherwise text preview with <mark>)
+# - Evidence previewer (PDF page image highlighting if PyMuPDF + Pillow; else text preview with <mark>)
 # - Generate Responses uses a global loader with progress
 # - FAST indexing:
 #     * One Document per PDF page (keeps page metadata)
 #     * Page-by-page pre-embedding with batching
 #     * SQLite embedding cache keyed by hash of token-truncated text
-#     * Configurable token truncation (to shrink payload) + API batch sizes
+#     * Configurable token truncation + API batch sizes
 # - Thread-safe SQLite usage (connection created/closed inside build function)
-# - NEW: Sidebar "Ping embedder" to benchmark embedding latency
+# - Embedding debugger: sidebar toggle; debug runs INSIDE the build-index function
 
 import os
 import io
@@ -85,56 +85,8 @@ with st.sidebar:
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
     embed_max_tokens = st.slider("Embedding max tokens per node", 256, 4096, 768, 64)
 
-    # ---- Ping embedder controls ----
-    st.markdown("### Ping Embedder (debug)")
-    ping_batches = st.number_input("Batches to send", min_value=1, max_value=100, value=3, step=1)
-    ping_batch_size = st.number_input("Items per batch", min_value=1, max_value=256, value=32, step=1)
-    ping_tokens = st.number_input("Target tokens per item", min_value=16, max_value=4096, value=256, step=16)
-    verbose_ping = st.checkbox("Show per-batch timings", value=True)
-    if st.button("🔎 Ping embedder"):
-        # Run a quick benchmark with current model/settings
-        def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-            enc = tiktoken.get_encoding("cl100k_base")
-            toks = enc.encode(text)
-            return text if len(toks) <= max_tokens else enc.decode(toks[:max_tokens])
-
-        def _make_dummy_text(max_tokens: int) -> str:
-            # create deterministic dummy text around requested tokens
-            base = ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 80).strip()
-            return _truncate_to_tokens(base, max_tokens)
-
-        # Ensure LlamaIndex is configured to use the chosen embedding endpoint
-        def _ensure_llm_embed():
-            kwargs = {}
-            if base_url:
-                kwargs["base_url"] = base_url
-            Settings.llm = OpenAI(model=chat_model, temperature=temperature, api_key=api_key or None, **kwargs)
-            Settings.embed_model = OpenAIEmbedding(model=embed_model, api_key=api_key or None, base_url=base_url or None)
-
-        _ensure_llm_embed()
-        dummy = _make_dummy_text(int(ping_tokens))
-        batch_payload = [dummy for _ in range(int(ping_batch_size))]
-
-        with st.status(f"Pinging embedder ({embed_model})…", state="running", expanded=True) as status:
-            total_items = int(ping_batches) * int(ping_batch_size)
-            times = []
-            t0_all = time.time()
-            for b in range(int(ping_batches)):
-                t0 = time.time()
-                _ = Settings.embed_model.get_text_embedding_batch(batch_payload)
-                dt = time.time() - t0
-                times.append(dt)
-                if verbose_ping:
-                    status.write(f"Batch {b+1}/{ping_batches}: {dt:.2f}s  (~{dt/ping_batch_size:.2f}s/item)")
-            dt_all = time.time() - t0_all
-            per_batch = sum(times) / len(times)
-            per_item  = dt_all / total_items
-            status.update(label="Ping complete", state="complete", expanded=False)
-        st.success(f"Embedder ping — model: **{embed_model}**, batches: {ping_batches}, batch size: {ping_batch_size}, "
-                   f"tokens/item: {ping_tokens}\n\n"
-                   f"• Avg per batch: **{per_batch:.2f}s**\n"
-                   f"• Avg per item: **{per_item:.2f}s**\n"
-                   f"• Total time: **{dt_all:.2f}s** for {total_items} items")
+    # Toggle-only debugger (persisted in session; used inside build function)
+    embed_debug = st.toggle("Enable embedding debugger", value=False, key="embed_debug")
 
     show_debug = st.toggle("Show Judge Raw Output (debug)", value=False)
 
@@ -218,6 +170,10 @@ def fingerprint_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 def highlight_html(text: str, needle: str, window: int = 400) -> str:
+    """
+    Text-based fallback preview: returns a small HTML slice around the first occurrence of needle,
+    with <mark>...</mark> highlighting. If needle not found, returns a truncated preview.
+    """
     text_norm = re.sub(r"\s+", " ", text or "")
     n = (needle or "").strip()
 
@@ -240,8 +196,9 @@ def highlight_html(text: str, needle: str, window: int = 400) -> str:
     return f"<pre>{before}<mark>{match}</mark>{after}</pre>"
 
 def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text: str):
+    """Render a PDF page image and draw highlight rectangles for query_text (best-effort)."""
     if not (fitz and Image and ImageDraw):
-        return None
+        return None  # visual backend not available
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         page = doc[page_num - 1]
@@ -254,7 +211,7 @@ def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text:
         img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
         if rects:
             draw = ImageDraw.Draw(img)
-            for r in rects[:5]:
+            for r in rects[:5]:  # cap highlights
                 draw.rectangle([(r.x0, r.y0), (r.x1, r.y1)], outline=(255, 0, 0), width=4)
         return img
     except Exception:
@@ -277,25 +234,32 @@ if "email_index" not in st.session_state:
 if "vector_ready" not in st.session_state:
     st.session_state.vector_ready = False
 
+# sets to identify which filenames belong to which corpus (used for fallback)
 if "policy_files_set" not in st.session_state:
     st.session_state.policy_files_set = set()
 if "email_files_set" not in st.session_state:
     st.session_state.email_files_set = set()
 
+# sets of file hashes to dedupe uploads across reruns
 if "policy_loaded_hashes" not in st.session_state:
     st.session_state.policy_loaded_hashes = set()
 if "email_loaded_hashes" not in st.session_state:
     st.session_state.email_loaded_hashes = set()
 
+# map of filename -> raw bytes (for previews)
 if "file_bytes_map" not in st.session_state:
     st.session_state.file_bytes_map: Dict[str, bytes] = {}
+
+# PDF page text cache: filename -> {page_num: text}
 if "pdf_page_texts" not in st.session_state:
     st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
 
+# embedding cache path (thread-safe handling done during build)
 if "embed_cache_path" not in st.session_state:
     st.session_state.embed_cache_path = "embed_cache.sqlite3"
 
 def _init_embed_cache(path: str):
+    """Create DB & table if needed, then close immediately (no long-lived connection)."""
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         with conn:
@@ -305,11 +269,13 @@ def _init_embed_cache(path: str):
                   v TEXT NOT NULL
                 )
             """)
+            # Optional pragmas for speed
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
     finally:
         conn.close()
 
+# Ensure cache DB exists
 _init_embed_cache(st.session_state.embed_cache_path)
 
 
@@ -334,13 +300,14 @@ def add_to_docs(files, target_list, corpus_name: str):
         f.seek(0)
         digest = fingerprint_bytes(data)
 
+        # choose the right set for dedupe
         seen_set = (
             st.session_state.policy_loaded_hashes
             if corpus_name == "policy"
             else st.session_state.email_loaded_hashes
         )
         if digest in seen_set:
-            continue
+            continue  # already loaded this exact file in this session
 
         lower = name.lower()
         if lower.endswith(".pdf"):
@@ -348,6 +315,7 @@ def add_to_docs(files, target_list, corpus_name: str):
             if not any(txt.strip() for _, txt in pages):
                 st.warning(f"Empty/unsupported PDF: {name}")
                 continue
+            # One Document per PDF page, so we can keep page metadata
             for page_num, txt in pages:
                 target_list.append(Document(text=txt, metadata={"source": name, "page": page_num}))
             st.session_state.file_bytes_map[name] = data
@@ -443,23 +411,60 @@ def build_index_incremental_preembedded_cached(
     api_batch_size: int,
     max_tokens: int,
 ) -> VectorStoreIndex:
+    """
+    1) Pages -> nodes (keeps page metadata)
+    2) For each node: normalize + token-truncate + hash
+    3) Pull cached embeddings by hash; embed only misses (batched)
+    4) Attach embeddings to nodes; add to BOTH SimpleVectorStore AND docstore
+    5) Return a VectorStoreIndex bound to the same storage_context (no from_vector_store)
+
+    If sidebar toggle 'Enable embedding debugger' is ON:
+      - Baseline ping before starting (synthetic payload)
+      - Per-batch timing logs for cache misses
+      - Summary at the end
+    """
+    # Prepare shared storage (vector store + docstore)
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    index = VectorStoreIndex([], storage_context=storage_context)
     if not docs:
-        return index
+        return VectorStoreIndex([], storage_context=storage_context)
+
+    # Helpers
+    def _dummy_text(tokens: int = 256) -> str:
+        base = ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 80).strip()
+        return _truncate_to_tokens(base, tokens)
 
     parser = Settings.node_parser
     total_pages = len(docs)
     db_path = st.session_state.embed_cache_path
 
+    # Debugger defaults
+    DBG_PING_BATCHES = 3
+    DBG_PING_BATCH_SIZE = 16
+    DBG_PING_TOKENS = 256
+
     with st.status(f"Embedding {label} ({total_pages} pages)…", state="running", expanded=True) as status:
         outer_pb = st.progress(0.0)
         t0_all = time.time()
-        total_nodes = 0
-        total_hits = 0
-        total_miss = 0
+        total_nodes = total_hits = total_miss = 0
 
+        # Optional: baseline ping
+        if st.session_state.get("embed_debug", False):
+            status.write(f"🔎 Debugger: baseline ping on {DBG_PING_BATCHES}×{DBG_PING_BATCH_SIZE} items @ ~{DBG_PING_TOKENS} tokens…")
+            dummy = _dummy_text(DBG_PING_TOKENS)
+            ping_times = []
+            t_ping_all = time.time()
+            for b in range(DBG_PING_BATCHES):
+                batch_payload = [dummy] * DBG_PING_BATCH_SIZE
+                t0 = time.time()
+                _ = Settings.embed_model.get_text_embedding_batch(batch_payload)
+                dt = time.time() - t0
+                ping_times.append(dt)
+                status.write(f"• Baseline batch {b+1}/{DBG_PING_BATCHES}: {dt:.2f}s (~{dt/DBG_PING_BATCH_SIZE:.2f}s/item)")
+            dt_ping_all = time.time() - t_ping_all
+            status.write(f"✅ Baseline: avg/batch {sum(ping_times)/len(ping_times):.2f}s, avg/item {dt_ping_all/(DBG_PING_BATCHES*DBG_PING_BATCH_SIZE):.2f}s")
+
+        # Thread-safe SQLite connection
         conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -467,10 +472,12 @@ def build_index_incremental_preembedded_cached(
 
             for i in range(0, total_pages, page_batch_size):
                 batch_docs = docs[i:i+page_batch_size]
+
+                # 1) pages -> nodes
                 nodes: List[TextNode] = parser.get_nodes_from_documents(batch_docs)
 
-                texts: List[str] = []
-                hashes: List[str] = []
+                # 2) normalize + truncate + hash
+                texts, hashes = [], []
                 for n in nodes:
                     raw = n.get_content(metadata_mode="none")
                     norm = _normalize_for_hash(raw)
@@ -478,29 +485,45 @@ def build_index_incremental_preembedded_cached(
                     texts.append(trunc)
                     hashes.append(_sha(trunc))
 
+                # 3) cache lookup
                 cache_map = _cache_get_many(conn, hashes)
                 hits = sum(1 for h in hashes if h in cache_map)
                 miss_idx = [idx for idx, h in enumerate(hashes) if h not in cache_map]
                 miss_texts = [texts[idx] for idx in miss_idx]
 
+                # embed misses in API sub-batches
                 new_items: Dict[str, List[float]] = {}
                 if miss_texts:
                     t0 = time.time()
+                    embed_items = 0
                     for j in range(0, len(miss_texts), api_batch_size):
                         sub = miss_texts[j:j+api_batch_size]
+                        t_sub = time.time()
                         embs = Settings.embed_model.get_text_embedding_batch(sub)
+                        sub_dt = time.time() - t_sub
+                        if st.session_state.get("embed_debug", False):
+                            status.write(
+                                f"• Miss-embed sub-batch {j//api_batch_size+1}/"
+                                f"{(len(miss_texts)+api_batch_size-1)//api_batch_size}: "
+                                f"{sub_dt:.2f}s (~{sub_dt/max(1,len(sub)):.2f}s/item) size={len(sub)}"
+                            )
                         for k, e in enumerate(embs):
                             new_items[hashes[miss_idx[j+k]]] = e
+                        embed_items += len(sub)
                     _cache_set_many(conn, new_items)
                     dt = time.time() - t0
-                    status.write(f"• Embedded {len(miss_texts)} new nodes in {dt:.1f}s ({dt/max(1,len(miss_texts)):.2f}s/item)")
+                    status.write(f"• Embedded {embed_items} new nodes in {dt:.2f}s (~{dt/max(1,embed_items):.2f}s/item)")
                 else:
                     status.write("• All nodes from this batch served from cache")
 
+                # 4) attach embeddings and add to BOTH vector store and docstore
                 for n, h in zip(nodes, hashes):
                     vec = cache_map.get(h) or new_items.get(h)
-                    n.embedding = vec
+                    n.embedding = vec  # prevents re-embedding
+
+                # IMPORTANT: add to vector store AND docstore so text is available for retrieval
                 vector_store.add(nodes)
+                storage_context.docstore.add_nodes(nodes)
 
                 total_nodes += len(nodes)
                 total_hits  += hits
@@ -508,7 +531,10 @@ def build_index_incremental_preembedded_cached(
 
                 pages_done = min(total_pages, i + len(batch_docs))
                 outer_pb.progress(min(1.0, pages_done / total_pages))
-                status.write(f"Progress: pages {pages_done}/{total_pages} | nodes: {total_nodes} | cache hits: {total_hits} | misses: {total_miss}")
+                status.write(
+                    f"Progress: pages {pages_done}/{total_pages} | nodes: {total_nodes} | "
+                    f"cache hits: {total_hits} | misses: {total_miss}"
+                )
         finally:
             conn.close()
 
@@ -519,7 +545,8 @@ def build_index_incremental_preembedded_cached(
             expanded=False
         )
 
-    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+    # 5) Build a handle bound to this storage (no from_vector_store)
+    return VectorStoreIndex([], storage_context=storage_context)
 
 
 # ---------------------------
@@ -559,7 +586,7 @@ if st.button("🔧 Build / Rebuild Indexes"):
 
 
 # ---------------------------
-# Prompts (strict JSON judge; braces escaped)
+# Prompts (strict JSON judge)
 # ---------------------------
 DRAFT_PROMPT = """You are a compliance assistant drafting replies to financial regulators.
 ONLY use the EVIDENCE provided. If evidence is insufficient or conflicting, state this clearly.
@@ -605,6 +632,7 @@ Return:
 # Robust JSON extraction + fallback helpers
 # ---------------------------
 def extract_first_json_obj(s: str) -> Optional[dict]:
+    """Extract the first valid top-level {...} JSON object from a string."""
     if not s:
         return None
     s_stripped = s.strip()
@@ -662,6 +690,13 @@ def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
     return out
 
 def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
+    """
+    Returns:
+      evidence_text: str
+      tag_to_file: {tag -> filename}
+      tag_to_score: {tag -> similarity_score}
+      tag_to_page: {tag -> page_number or None}
+    """
     evidence_lines: List[str] = []
     tag_to_file: Dict[str, str] = {}
     tag_to_score: Dict[str, float] = {}
@@ -670,7 +705,7 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
     for i, nws in enumerate(nodes_ws):
         node = nws.node
         src = (node.metadata or {}).get("source", "unknown")
-        page = (node.metadata or {}).get("page")
+        page = (node.metadata or {}).get("page")  # int or None
         if page is not None:
             tag = f"[Doc: {src}, Page {page}, Node {i}]"
         else:
@@ -718,6 +753,7 @@ if st.button("🧠 Generate Responses"):
         configure_settings()
         llm = Settings.llm
 
+        # Collate deduped questions from both inputs
         typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
         edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
         questions, seen = [], set()
@@ -735,14 +771,17 @@ if st.button("🧠 Generate Responses"):
                 for idx, q in enumerate(questions, start=1):
                     status.write(f"Processing **{q}** ({idx}/{total})")
 
+                    # Retrieve (with scores + pages)
                     nodes_ws = retrieve_across(q, top_k)
                     if nodes_ws:
                         ev_str, tag2file, tag2score, tag2page = nodes_to_evidence(nodes_ws)
                     else:
                         ev_str, tag2file, tag2score, tag2page = "(no evidence found)", {}, {}, {}
 
+                    # Draft
                     draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
 
+                    # Judge (robust JSON parse)
                     judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
                     parsed = extract_first_json_obj(judge_raw)
 
@@ -754,11 +793,13 @@ if st.button("🧠 Generate Responses"):
                         except Exception:
                             confidence = 0.0
                     else:
+                        # Fallback: pick top-3 by similarity, infer source_type & confidence
                         sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
                         keep = [t for (t, _) in sorted_tags[:3]]
                         source_type = infer_source_type_from_tags(keep, tag2file)
                         confidence = confidence_from_scores(tag2score, keep)
 
+                    # Derive kept docs + snippets
                     ev_snips, kept_docs = [], []
                     if ev_str != "(no evidence found)":
                         lines = ev_str.splitlines()
@@ -791,6 +832,7 @@ if st.button("🧠 Generate Responses"):
 
                 status.update(label="Responses generated", state="complete", expanded=False)
 
+            # ---- Render AFTER work completes ----
             for r in results:
                 with st.expander(f"❓ {r['question']}", expanded=False):
                     left, right = st.columns([2, 1])
@@ -813,7 +855,8 @@ if st.button("🧠 Generate Responses"):
                         for sn in r["ev_snips"]:
                             st.code(sn, language="text")
 
-                            tag = sn.split("]")[0] + "]"
+                            # Inline previewer per snippet
+                            tag = sn.split("]")[0] + "]"  # "[Doc: ..., Page X, Node i]"
                             fname = r["tag2file"].get(tag)
                             page = r["tag2page"].get(tag)
                             query_text = sn[len(tag):].strip()
