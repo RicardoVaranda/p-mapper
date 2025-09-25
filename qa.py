@@ -1,11 +1,9 @@
 # app.py — Regulatory Response Assistant (Streamlit + LlamaIndex <= 0.12.53)
 # -------------------------------------------------------------------------
 # Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
-# Dynamically add questions (textarea or table)
-# Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
-#
-# This version removes all tokenization/truncation logic.
-# It relies purely on LlamaIndex chunking (SentenceSplitter) to keep chunks manageable.
+# Ask regulator questions → evidence-backed drafts + citations
+# Tokenizers removed: relies only on LlamaIndex chunking (SentenceSplitter)
+# Embedding cache is JSON-safe (numpy arrays normalized to list[float])
 
 import os
 import io
@@ -71,10 +69,10 @@ with st.sidebar:
     embed_page_batch = st.slider("Embed page batch (pages → nodes)", 2, 64, 16, 2)
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
 
-    # NOTE: kept for UI continuity; ignored in chunking-only mode
-    embed_max_tokens = st.slider("Max tokens per node (ignored with chunking-only)", 256, 4096, 768, 64)
+    # kept for UI continuity; not used in chunking-only mode
+    st.slider("Max tokens per node (ignored here)", 256, 4096, 768, 64, key="embed_max_tokens_ignored")
 
-    # Toggle-only debugger (persisted; used inside build function)
+    # Toggle-only debugger (used inside build function)
     st.toggle("Enable embedding debugger", value=False, key="embed_debug")
 
     st.toggle("Show Judge Raw Output (debug)", value=False, key="show_debug")
@@ -120,7 +118,7 @@ def configure_settings():
         api_key=api_key or None,
         base_url=base_url or None
     )
-    # Chunking controls the node size; truncation removed.
+    # Chunking controls node size; no truncation used.
     Settings.node_parser = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
 configure_settings()
@@ -330,8 +328,25 @@ with colB:
         st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
 
 # ---------------------------
-# Embedding cache helpers (hashes use normalized full chunk text)
+# Embedding cache helpers (JSON-safe; ndarray -> list[float])
 # ---------------------------
+def _as_float_list(vec):
+    """Return a plain Python list[float] from numpy arrays, lists, tuples, etc."""
+    try:
+        if hasattr(vec, "tolist"):
+            vec = vec.tolist()
+    except Exception:
+        pass
+    if isinstance(vec, (list, tuple)):
+        try:
+            return [float(x) for x in vec]
+        except Exception:
+            return list(vec)
+    try:
+        return [float(x) for x in list(vec)]
+    except Exception:
+        return []
+
 def _cache_get_many(conn, hashes: List[str]) -> Dict[str, List[float]]:
     if not hashes:
         return {}
@@ -340,9 +355,10 @@ def _cache_get_many(conn, hashes: List[str]) -> Dict[str, List[float]]:
     out: Dict[str, List[float]] = {}
     for h, v_json in rows:
         try:
-            out[h] = json.loads(v_json)
+            arr = json.loads(v_json)
+            out[h] = [float(x) for x in arr] if isinstance(arr, list) else []
         except Exception:
-            pass
+            out[h] = []
     return out
 
 def _cache_set_many(conn, items: Dict[str, List[float]]):
@@ -351,18 +367,17 @@ def _cache_set_many(conn, items: Dict[str, List[float]]):
     with conn:
         conn.executemany(
             "INSERT OR REPLACE INTO emb_cache (h, v) VALUES (?, ?)",
-            [(h, json.dumps(vec)) for h, vec in items.items()],
+            [(h, json.dumps(_as_float_list(vec))) for h, vec in items.items()],
         )
 
 def _normalize_for_hash(s: str) -> str:
-    # minimal normalization so identical text yields identical hashes
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ---------------------------
-# Build indexes — pre-embedded + cached (FAST) with docstore-first write
+# Build indexes — pre-embedded + cached (docstore-first write)
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -452,7 +467,7 @@ def build_index_incremental_preembedded_cached(
                                 f"{sub_dt:.2f}s (~{sub_dt/max(1,len(sub)):.2f}s/item) size={len(sub)}"
                             )
                         for k, e in enumerate(embs):
-                            new_items[hashes[miss_idx[j+k]]] = e
+                            new_items[hashes[miss_idx[j+k]]] = _as_float_list(e)
                         embed_items += len(sub)
                     _cache_set_many(conn, new_items)
                     dt = time.time() - t0
@@ -463,7 +478,7 @@ def build_index_incremental_preembedded_cached(
                 # attach embeddings
                 for n, h in zip(nodes, hashes):
                     vec = cache_map.get(h) or new_items.get(h)
-                    n.embedding = vec
+                    n.embedding = _as_float_list(vec) if vec is not None else None
 
                 # ✅ write to DOCSTORE first, then vector store (prevents KeyError on retrieve)
                 storage_context.docstore.add_documents(nodes)
@@ -775,6 +790,7 @@ q_table = st.data_editor(
 # Generate Responses (lazy-build if needed)
 # ---------------------------
 if st.button("🧠 Generate Responses"):
+    # loader/status so users know work is running
     ready = ensure_indexes_built()
     if not ready:
         st.error("No indexes available. Upload documents and build indexes first (or re-upload so I can rebuild from cache).")
