@@ -3,6 +3,9 @@
 # Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
 # Dynamically add questions (textarea or table)
 # Retrieve evidence from both corpora, draft regulator-ready reply, judge & cite
+#
+# This version removes all tokenization/truncation logic.
+# It relies purely on LlamaIndex chunking (SentenceSplitter) to keep chunks manageable.
 
 import os
 import io
@@ -16,7 +19,6 @@ from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import docx2txt
-import tiktoken
 from PyPDF2 import PdfReader
 
 # Optional preview backends (visual PDF previews)
@@ -68,7 +70,9 @@ with st.sidebar:
     st.markdown("### Embedding Performance")
     embed_page_batch = st.slider("Embed page batch (pages → nodes)", 2, 64, 16, 2)
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
-    embed_max_tokens = st.slider("Embedding max tokens per node", 256, 4096, 768, 64)
+
+    # NOTE: kept for UI continuity; ignored in chunking-only mode
+    embed_max_tokens = st.slider("Max tokens per node (ignored with chunking-only)", 256, 4096, 768, 64)
 
     # Toggle-only debugger (persisted; used inside build function)
     st.toggle("Enable embedding debugger", value=False, key="embed_debug")
@@ -116,6 +120,7 @@ def configure_settings():
         api_key=api_key or None,
         base_url=base_url or None
     )
+    # Chunking controls the node size; truncation removed.
     Settings.node_parser = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
 configure_settings()
@@ -325,7 +330,7 @@ with colB:
         st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
 
 # ---------------------------
-# Embedding cache helpers
+# Embedding cache helpers (hashes use normalized full chunk text)
 # ---------------------------
 def _cache_get_many(conn, hashes: List[str]) -> Dict[str, List[float]]:
     if not hashes:
@@ -350,17 +355,11 @@ def _cache_set_many(conn, items: Dict[str, List[float]]):
         )
 
 def _normalize_for_hash(s: str) -> str:
+    # minimal normalization so identical text yields identical hashes
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    enc = tiktoken.get_encoding("cl100k_base")
-    toks = enc.encode(text)
-    if len(toks) <= max_tokens:
-        return text
-    return enc.decode(toks[:max_tokens])
 
 # ---------------------------
 # Build indexes — pre-embedded + cached (FAST) with docstore-first write
@@ -370,12 +369,12 @@ def build_index_incremental_preembedded_cached(
     label: str,
     page_batch_size: int,
     api_batch_size: int,
-    max_tokens: int,
+    max_tokens_unused: int,   # kept for signature compatibility; ignored
 ) -> VectorStoreIndex:
     """
     Build a VectorStoreIndex from documents:
-      - Page-by-page nodes
-      - Token-truncated hashing for cached embeddings
+      - Page-by-page nodes via SentenceSplitter (chunking-only; no truncation)
+      - Hash full normalized chunk text for caching
       - Cache hits/misses + optional per-batch debug timings
       - Store nodes in DOCSTORE first, then vector store (prevents KeyError)
     """
@@ -386,9 +385,8 @@ def build_index_incremental_preembedded_cached(
     if not docs:
         return VectorStoreIndex([], storage_context=storage_context)
 
-    def _dummy_text(tokens: int = 256) -> str:
-        base = ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 80).strip()
-        return _truncate_to_tokens(base, tokens)
+    def _dummy_text() -> str:
+        return ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 50).strip()
 
     parser = Settings.node_parser
     total_pages = len(docs)
@@ -396,7 +394,6 @@ def build_index_incremental_preembedded_cached(
 
     DBG_PING_BATCHES = 3
     DBG_PING_BATCH_SIZE = 16
-    DBG_PING_TOKENS = 256
 
     with st.status(f"Embedding {label} ({total_pages} pages)…", state="running", expanded=True) as status:
         outer_pb = st.progress(0.0)
@@ -404,8 +401,8 @@ def build_index_incremental_preembedded_cached(
         total_nodes = total_hits = total_miss = 0
 
         if st.session_state.get("embed_debug", False):
-            status.write(f"🔎 Debugger: baseline ping on {DBG_PING_BATCHES}×{DBG_PING_BATCH_SIZE} items @ ~{DBG_PING_TOKENS} tokens…")
-            dummy = _dummy_text(DBG_PING_TOKENS)
+            status.write(f"🔎 Debugger: baseline ping on {DBG_PING_BATCHES}×{DBG_PING_BATCH_SIZE} dummy items…")
+            dummy = _dummy_text()
             ping_times = []
             t_ping_all = time.time()
             for b in range(DBG_PING_BATCHES):
@@ -416,7 +413,7 @@ def build_index_incremental_preembedded_cached(
                 ping_times.append(dt)
                 status.write(f"• Baseline batch {b+1}/{DBG_PING_BATCHES}: {dt:.2f}s (~{dt/DBG_PING_BATCH_SIZE:.2f}s/item)")
             dt_ping_all = time.time() - t_ping_all
-            status.write(f"✅ Baseline: avg/batch {sum(ping_times)/len(ping_times):.2f}s, avg/item {dt_ping_all/(DBG_PING_BATCHES*DBG_PING_BATCH_SIZE):.2f}s")
+            status.write(f"✅ Baseline avg/batch {sum(ping_times)/len(ping_times):.2f}s, avg/item {dt_ping_all/(DBG_PING_BATCHES*DBG_PING_BATCH_SIZE):.2f}s")
 
         conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
@@ -431,9 +428,8 @@ def build_index_incremental_preembedded_cached(
                 for n in nodes:
                     raw = n.get_content(metadata_mode="none")
                     norm = _normalize_for_hash(raw)
-                    trunc = _truncate_to_tokens(norm, max_tokens=max_tokens)
-                    texts.append(trunc)
-                    hashes.append(_sha(trunc))
+                    texts.append(norm)
+                    hashes.append(_sha(norm))
 
                 cache_map = _cache_get_many(conn, hashes)
                 hits = sum(1 for h in hashes if h in cache_map)
@@ -512,7 +508,7 @@ def ensure_indexes_built() -> bool:
                     label="Policy corpus",
                     page_batch_size=embed_page_batch,
                     api_batch_size=embed_api_batch,
-                    max_tokens=embed_max_tokens,
+                    max_tokens_unused=0,  # ignored
                 )
             if need_email:
                 st.session_state.email_index = build_index_incremental_preembedded_cached(
@@ -520,7 +516,7 @@ def ensure_indexes_built() -> bool:
                     label="Prior responses corpus",
                     page_batch_size=embed_page_batch,
                     api_batch_size=embed_api_batch,
-                    max_tokens=embed_max_tokens,
+                    max_tokens_unused=0,  # ignored
                 )
 
     st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
@@ -542,7 +538,7 @@ if st.button("🔧 Build / Rebuild Indexes"):
                 label="Policy corpus",
                 page_batch_size=embed_page_batch,
                 api_batch_size=embed_api_batch,
-                max_tokens=embed_max_tokens,
+                max_tokens_unused=0,  # ignored
             )
         else:
             st.session_state.policy_index = None
@@ -553,7 +549,7 @@ if st.button("🔧 Build / Rebuild Indexes"):
                 label="Prior responses corpus",
                 page_batch_size=embed_page_batch,
                 api_batch_size=embed_api_batch,
-                max_tokens=embed_max_tokens,
+                max_tokens_unused=0,  # ignored
             )
         else:
             st.session_state.email_index = None
@@ -643,299 +639,4 @@ def infer_source_type_from_tags(tags: List[str], tag_to_file: Dict[str, str]) ->
         return "PriorEmail"
     return "Insufficient"
 
-def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str]) -> float:
-    use_tags = kept_tags or list(tag_to_score.keys())
-    scores = [tag_to_score.get(t, 0.0) for t in use_tags]
-    if not scores:
-        return 0.0
-    clipped = [min(1.0, max(0.0, float(s))) for s in scores]
-    avg = sum(clipped) / len(clipped)
-    return round(max(0.05, min(0.99, avg)), 3)
-
-# ---------------------------
-# Resilient retrieval with direct-query fallback + auto-repair
-# ---------------------------
-def _repair_index(kind: str) -> Optional[VectorStoreIndex]:
-    """Rebuild a single index (policy|email) from loaded docs, using cached embeddings."""
-    if kind == "policy" and st.session_state.policy_docs:
-        st.info("Repairing policy index from cache…")
-        idx = build_index_incremental_preembedded_cached(
-            st.session_state.policy_docs,
-            label="Policy corpus (repair)",
-            page_batch_size=embed_page_batch,
-            api_batch_size=embed_api_batch,
-            max_tokens=embed_max_tokens,
-        )
-        st.session_state.policy_index = idx
-        return idx
-    if kind == "email" and st.session_state.email_docs:
-        st.info("Repairing prior responses index from cache…")
-        idx = build_index_incremental_preembedded_cached(
-            st.session_state.email_docs,
-            label="Prior responses corpus (repair)",
-            page_batch_size=embed_page_batch,
-            api_batch_size=embed_api_batch,
-            max_tokens=embed_max_tokens,
-        )
-        st.session_state.email_index = idx
-        return idx
-    return None
-
-def _direct_query_nodes(index: VectorStoreIndex, q: str, k: int) -> List[NodeWithScore]:
-    """Query the vector store directly and safely build NodeWithScore list, skipping missing docstore IDs."""
-    try:
-        q_emb = Settings.embed_model.get_text_embedding(q)
-        vs = getattr(index, "_vector_store", None) or getattr(index, "vector_store", None)
-        ds = getattr(index, "_docstore", None) or index.storage_context.docstore
-        if vs is None or ds is None:
-            return []
-        res = vs.query(VectorStoreQuery(query_embedding=q_emb, similarity_top_k=k))
-        nodes_ws: List[NodeWithScore] = []
-        if not res or not getattr(res, "ids", None):
-            return nodes_ws
-        sims = res.similarities or [0.0] * len(res.ids)
-        for nid, score in zip(res.ids, sims):
-            node = ds.get_document(nid, raise_error=False)
-            if node is not None:
-                nodes_ws.append(NodeWithScore(node=node, score=score))
-        return nodes_ws
-    except Exception as e:
-        st.warning(f"Direct vector query failed: {e}")
-        return []
-
-def _safe_retrieve_with_fallback(index: Optional[VectorStoreIndex], kind: str, q: str, k: int) -> List[NodeWithScore]:
-    """Try standard retriever; on KeyError use direct-query fallback; if still empty, repair index and retry."""
-    if not index:
-        return []
-    try:
-        r = VectorIndexRetriever(index=index, similarity_top_k=k)
-        return r.retrieve(q)
-    except KeyError:
-        nodes = _direct_query_nodes(index, q, k)
-        if nodes:
-            return nodes
-        idx2 = _repair_index(kind)
-        if not idx2:
-            st.warning(f"Unable to repair {kind} index (no docs).")
-            return []
-        try:
-            r2 = VectorIndexRetriever(index=idx2, similarity_top_k=k)
-            return r2.retrieve(q)
-        except KeyError:
-            return _direct_query_nodes(idx2, q, k)
-
-def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
-    out: List[NodeWithScore] = []
-    out += _safe_retrieve_with_fallback(st.session_state.policy_index, "policy", q, k)
-    out += _safe_retrieve_with_fallback(st.session_state.email_index,  "email",  q, k)
-    return out
-
-def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
-    evidence_lines: List[str] = []
-    tag_to_file: Dict[str, str] = {}
-    tag_to_score: Dict[str, float] = {}
-    tag_to_page: Dict[str, Optional[int]] = {}
-
-    for i, nws in enumerate(nodes_ws):
-        node = nws.node
-        src = (node.metadata or {}).get("source", "unknown")
-        page = (node.metadata or {}).get("page")
-        if page is not None:
-            tag = f"[Doc: {src}, Page {page}, Node {i}]"
-        else:
-            tag = f"[Doc: {src}, Node {i}]"
-        text = re.sub(r"\s+", " ", node.get_text()).strip()
-        evidence_lines.append(f"{tag} {text}")
-        tag_to_file[tag] = src
-        tag_to_page[tag] = page
-        try:
-            tag_to_score[tag] = float(nws.score or 0.0)
-        except Exception:
-            tag_to_score[tag] = 0.0
-
-    return "\n".join(evidence_lines), tag_to_file, tag_to_score, tag_to_page
-
-# ---------------------------
-# Questions UI
-# ---------------------------
-st.markdown("### Ask Regulator Questions")
-
-qs_text = st.text_area(
-    "Paste questions (one per line):",
-    height=120,
-    placeholder="e.g., Describe our data retention policy for customer PII.\n"
-                "e.g., Summarize the remediation timeline for the 2023 key management audit finding."
-)
-
-st.markdown("Or build them interactively:")
-q_table = st.data_editor(
-    st.session_state.get("q_table", [{"question": ""}]),
-    num_rows="dynamic",
-    key="q_editor",
-    column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
-)
-
-# ---------------------------
-# Build / Rebuild Indexes button (manual)
-# ---------------------------
-# (Already defined above; left in place for explicit rebuilds)
-
-# ---------------------------
-# Generate Responses (lazy-build if needed)
-# ---------------------------
-if st.button("🧠 Generate Responses"):
-    ready = ensure_indexes_built()
-    if not ready:
-        st.error("No indexes available. Upload documents and build indexes first (or re-upload so I can rebuild from cache).")
-        st.stop()
-
-    configure_settings()
-    llm = Settings.llm
-
-    typed = [q.strip() for q in qs_text.split("\n") if q.strip()]
-    edited = [row.get("question", "").strip() for row in q_table if row.get("question", "").strip()]
-    questions, seen = [], set()
-    for q in (typed + edited):
-        if q not in seen:
-            questions.append(q)
-            seen.add(q)
-
-    if not questions:
-        st.warning("Please add at least one question.")
-    else:
-        results = []
-        with st.status("Generating responses…", state="running", expanded=True) as status:
-            total = len(questions)
-            for idx, q in enumerate(questions, start=1):
-                status.write(f"Processing **{q}** ({idx}/{total})")
-
-                nodes_ws = retrieve_across(q, top_k)
-                if nodes_ws:
-                    ev_str, tag2file, tag2score, tag2page = nodes_to_evidence(nodes_ws)
-                else:
-                    ev_str, tag2file, tag2score, tag2page = "(no evidence found)", {}, {}, {}
-
-                draft = llm.complete(DRAFT_PROMPT.format(question=q, evidence=ev_str)).text
-
-                judge_raw = llm.complete(JUDGE_PROMPT.format(question=q, draft=draft, evidence=ev_str)).text
-                parsed = extract_first_json_obj(judge_raw)
-
-                if parsed:
-                    source_type = parsed.get("source_type", "Insufficient")
-                    keep = [str(x) for x in parsed.get("keep_citations", [])]
-                    try:
-                        confidence = float(parsed.get("confidence", 0.0))
-                    except Exception:
-                        confidence = 0.0
-                else:
-                    sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
-                    keep = [t for (t, _) in sorted_tags[:3]]
-                    source_type = infer_source_type_from_tags(keep, tag2file)
-                    confidence = confidence_from_scores(tag2score, keep)
-
-                ev_snips, kept_docs = [], []
-                if ev_str != "(no evidence found)":
-                    lines = ev_str.splitlines()
-                    tag_set = set(keep) if keep else set()
-                    if tag_set:
-                        for line in lines:
-                            tag = line.split("]")[0] + "]"
-                            if tag in tag_set:
-                                ev_snips.append(line)
-                                kept_docs.append(tag2file.get(tag, "unknown"))
-                    else:
-                        for line in lines[:4]:
-                            ev_snips.append(line)
-                            m = re.search(r"\[Doc: (.*?)(?:, Page \d+)?, Node \d+\]", line)
-                            if m:
-                                kept_docs.append(m.group(1))
-                kept_docs = list(dict.fromkeys(kept_docs))[:5]
-
-                results.append({
-                    "question": q,
-                    "draft": draft,
-                    "source_type": source_type,
-                    "confidence": round(confidence, 3),
-                    "kept_docs": kept_docs,
-                    "ev_snips": ev_snips[:6],
-                    "judge_raw": judge_raw,
-                    "tag2file": tag2file,
-                    "tag2page": tag2page,
-                })
-
-            status.update(label="Responses generated", state="complete", expanded=False)
-
-        show_debug = st.session_state.get("show_debug", False)
-
-        for r in results:
-            with st.expander(f"❓ {r['question']}", expanded=False):
-                left, right = st.columns([2, 1])
-                with left:
-                    st.subheader("Suggested Response")
-                    st.write(r["draft"])
-                with right:
-                    st.subheader("Assessment")
-                    st.write(f"**Source Type:** {r['source_type']}")
-                    st.write(f"**Confidence:** {r['confidence']}")
-                    st.write("**Source Docs:**")
-                    if r["kept_docs"]:
-                        for d in r["kept_docs"]:
-                            st.write(f"- {d}")
-                    else:
-                        st.write("- (none)")
-
-                st.subheader("Evidence Snippets")
-                if r["ev_snips"]:
-                    for sn in r["ev_snips"]:
-                        st.code(sn, language="text")
-                        tag = sn.split("]")[0] + "]"
-                        fname = r["tag2file"].get(tag)
-                        page = r["tag2page"].get(tag)
-                        query_text = sn[len(tag):].strip()
-                        if len(query_text) > 500:
-                            query_text = query_text[:500]
-
-                        with st.expander("Show evidence"):
-                            if fname and page and fname in st.session_state.file_bytes_map:
-                                file_bytes = st.session_state.file_bytes_map[fname]
-                                img = render_pdf_page_with_highlight(file_bytes, page, query_text)
-                                if img is not None:
-                                    st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
-                                else:
-                                    page_text = ""
-                                    if fname in st.session_state.pdf_page_texts:
-                                        page_text = st.session_state.pdf_page_texts[fname].get(page, "")
-                                    if page_text:
-                                        safe_html = highlight_html(page_text, query_text, window=600)
-                                        st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
-                                        st.markdown(safe_html, unsafe_allow_html=True)
-                                    else:
-                                        st.info("Preview unavailable for this PDF page.")
-                            else:
-                                src_file = fname or "(unknown)"
-                                data = st.session_state.file_bytes_map.get(src_file)
-                                preview_text = ""
-                                if data:
-                                    lower = src_file.lower()
-                                    try:
-                                        if lower.endswith(".pdf"):
-                                            if src_file in st.session_state.pdf_page_texts:
-                                                preview_text = " ".join(st.session_state.pdf_page_texts[src_file].values())
-                                        elif lower.endswith(".docx"):
-                                            preview_text = read_docx(data)
-                                        elif lower.endswith(".txt"):
-                                            preview_text = read_txt(data)
-                                    except Exception:
-                                        preview_text = ""
-                                if preview_text:
-                                    safe_html = highlight_html(preview_text, query_text, window=600)
-                                    st.markdown(f"**{src_file} (text preview)**")
-                                    st.markdown(safe_html, unsafe_allow_html=True)
-                                else:
-                                    st.info("Preview unavailable for this evidence.")
-                else:
-                    st.write("_No supporting evidence found._")
-
-                if show_debug:
-                    st.subheader("Debug: Judge Raw Output")
-                    st.code(r["judge_raw"][:4000], language="json")
+def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str]) -> flo_
