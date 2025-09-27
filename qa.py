@@ -1,9 +1,8 @@
 # app.py — Regulatory Response Assistant (Streamlit + LlamaIndex <= 0.12.53)
 # -------------------------------------------------------------------------
-# Upload Company Policy docs and Prior Regulator Response emails (PDF/DOCX/TXT)
+# Upload Policy docs & Prior Regulator Responses (PDF/DOCX/TXT/XLSX/CSV)
 # Ask regulator questions → evidence-backed drafts + citations
-# Tokenizers removed: relies only on LlamaIndex chunking (SentenceSplitter)
-# Embedding cache is JSON-safe (numpy arrays normalized to list[float])
+# Chunking-only (no tokenizers). JSON-safe embed cache. Persistent indexes & files.
 
 import os
 import io
@@ -16,6 +15,7 @@ from html import escape
 from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
+import pandas as pd
 import docx2txt
 from PyPDF2 import PdfReader
 
@@ -33,6 +33,7 @@ except Exception:
 
 # ---- LlamaIndex (<=0.12.53) ----
 from llama_index.core import VectorStoreIndex, Document, Settings, StorageContext
+from llama_index.core import load_index_from_storage
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.llms.openai import OpenAI
@@ -41,6 +42,17 @@ from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.core.vector_stores import SimpleVectorStore
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.core.vector_stores.types import VectorStoreQuery
+
+# ---------------------------
+# Persistent storage roots
+# ---------------------------
+PERSIST_ROOT = ".storage"
+POLICY_DIR = os.path.join(PERSIST_ROOT, "policy")
+EMAIL_DIR  = os.path.join(PERSIST_ROOT, "email")
+FILES_ROOT = os.path.join(PERSIST_ROOT, "files")
+os.makedirs(POLICY_DIR, exist_ok=True)
+os.makedirs(EMAIL_DIR,  exist_ok=True)
+os.makedirs(FILES_ROOT, exist_ok=True)
 
 # ---------------------------
 # Page / Header
@@ -69,12 +81,10 @@ with st.sidebar:
     embed_page_batch = st.slider("Embed page batch (pages → nodes)", 2, 64, 16, 2)
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
 
-    # kept for UI continuity; not used in chunking-only mode
+    # kept only for UI continuity; unused in chunking-only mode
     st.slider("Max tokens per node (ignored here)", 256, 4096, 768, 64, key="embed_max_tokens_ignored")
 
-    # Toggle-only debugger (used inside build function)
     st.toggle("Enable embedding debugger", value=False, key="embed_debug")
-
     st.toggle("Show Judge Raw Output (debug)", value=False, key="show_debug")
 
     st.markdown("---")
@@ -82,22 +92,12 @@ with st.sidebar:
         st.info("PDF visual preview: **Enabled** (pymupdf + Pillow detected)")
     else:
         st.info("PDF visual preview: **Text-only fallback** (install `pymupdf` and `Pillow` to enable images)")
-    st.caption("Evidence-driven flow only. No deterministic or hard-coded validations.")
 
     # Clear/reset button
     if st.button("🧹 Clear loaded docs (reset)"):
-        st.session_state.policy_docs = []
-        st.session_state.email_docs = []
-        st.session_state.policy_loaded_hashes = set()
-        st.session_state.email_loaded_hashes = set()
-        st.session_state.policy_files_set = set()
-        st.session_state.email_files_set = set()
-        st.session_state.file_bytes_map = {}
-        st.session_state.pdf_page_texts = {}
-        st.session_state.policy_index = None
-        st.session_state.email_index = None
-        st.session_state.vector_ready = False
-        st.success("Cleared all loaded documents and indexes.")
+        st.session_state.clear()
+        # preserve persisted storage on disk; only clear in-memory session state
+        st.success("Cleared in-memory state. Persisted storage on disk remains.")
 
 # ---------------------------
 # Configure LlamaIndex defaults
@@ -124,7 +124,7 @@ def configure_settings():
 configure_settings()
 
 # ---------------------------
-# File readers & PDF helpers
+# File readers & helpers
 # ---------------------------
 def read_pdf_pages(file_bytes: bytes) -> List[Tuple[int, str]]:
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -150,6 +150,60 @@ def read_docx(file_bytes: bytes) -> str:
 
 def read_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
+
+def read_excel_rows(file_bytes: bytes) -> List[Tuple[str, int, Dict[str, str]]]:
+    """
+    Return list of (sheet_name, row_index_1based, ordered_row_dict).
+    Keeps original column order; includes only non-empty cells.
+    """
+    out: List[Tuple[str, int, Dict[str, str]]] = []
+    bio = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+        if df.empty:
+            continue
+        df = df.fillna("")
+        cols = [str(c) for c in df.columns]
+        for ridx, row in df.iterrows():
+            row_dict: Dict[str, str] = {}
+            for c in cols:
+                v = str(row[c]).strip()
+                if v != "":
+                    row_dict[c] = v
+            if not row_dict:
+                continue
+            out.append((sheet, int(ridx) + 1, row_dict))
+    return out
+
+def read_csv_rows(file_bytes: bytes) -> List[Tuple[str, int, Dict[str, str]]]:
+    """
+    Treat whole CSV as a single sheet 'CSV'.
+    Keeps original column order; includes only non-empty cells.
+    """
+    out: List[Tuple[str, int, Dict[str, str]] ] = []
+    bio = io.BytesIO(file_bytes)
+    df = pd.read_csv(bio, dtype=str)
+    if df.empty:
+        return out
+    df = df.fillna("")
+    cols = [str(c) for c in df.columns]
+    for ridx, row in df.iterrows():
+        row_dict: Dict[str, str] = {}
+        for c in cols:
+            v = str(row[c]).strip()
+            if v != "":
+                row_dict[c] = v
+        if not row_dict:
+            continue
+        out.append(("CSV", int(ridx) + 1, row_dict))
+    return out
+
+def row_dict_to_text(row: Dict[str, str]) -> str:
+    """Serialize an ordered row dict to text with no assumptions about headers."""
+    if not row:
+        return ""
+    return "\n".join(f"{k}: {v}" for k, v in row.items())
 
 def fingerprint_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -200,36 +254,51 @@ def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text:
 # ---------------------------
 # Session state
 # ---------------------------
-if "policy_docs" not in st.session_state:
-    st.session_state.policy_docs: List[Document] = []
-if "email_docs" not in st.session_state:
-    st.session_state.email_docs: List[Document] = []
+def ensure_state_defaults():
+    if "policy_docs" not in st.session_state:
+        st.session_state.policy_docs: List[Document] = []
+    if "email_docs" not in st.session_state:
+        st.session_state.email_docs: List[Document] = []
 
-if "policy_index" not in st.session_state:
-    st.session_state.policy_index = None
-if "email_index" not in st.session_state:
-    st.session_state.email_index = None
+    if "policy_index" not in st.session_state:
+        st.session_state.policy_index = None
+    if "email_index" not in st.session_state:
+        st.session_state.email_index = None
 
-if "vector_ready" not in st.session_state:
-    st.session_state.vector_ready = False
+    if "vector_ready" not in st.session_state:
+        st.session_state.vector_ready = False
 
-if "policy_files_set" not in st.session_state:
-    st.session_state.policy_files_set = set()
-if "email_files_set" not in st.session_state:
-    st.session_state.email_files_set = set()
+    if "policy_files_set" not in st.session_state:
+        st.session_state.policy_files_set = set()
+    if "email_files_set" not in st.session_state:
+        st.session_state.email_files_set = set()
 
-if "policy_loaded_hashes" not in st.session_state:
-    st.session_state.policy_loaded_hashes = set()
-if "email_loaded_hashes" not in st.session_state:
-    st.session_state.email_loaded_hashes = set()
+    if "policy_loaded_hashes" not in st.session_state:
+        st.session_state.policy_loaded_hashes = set()
+    if "email_loaded_hashes" not in st.session_state:
+        st.session_state.email_loaded_hashes = set()
 
-if "file_bytes_map" not in st.session_state:
-    st.session_state.file_bytes_map: Dict[str, bytes] = {}
-if "pdf_page_texts" not in st.session_state:
-    st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
+    if "file_bytes_map" not in st.session_state:
+        st.session_state.file_bytes_map: Dict[str, bytes] = {}
+    if "pdf_page_texts" not in st.session_state:
+        st.session_state.pdf_page_texts: Dict[str, Dict[int, str]] = {}
 
-if "embed_cache_path" not in st.session_state:
-    st.session_state.embed_cache_path = "embed_cache.sqlite3"
+    if "embed_cache_path" not in st.session_state:
+        st.session_state.embed_cache_path = "embed_cache.sqlite3"
+
+    # mapping original filename -> saved disk path for previews
+    if "saved_file_paths" not in st.session_state:
+        st.session_state.saved_file_paths = {}
+        try:
+            for fn in os.listdir(FILES_ROOT):
+                parts = fn.split("__", 1)
+                if len(parts) == 2:
+                    original = parts[1]
+                    st.session_state.saved_file_paths[original] = os.path.join(FILES_ROOT, fn)
+        except Exception:
+            pass
+
+ensure_state_defaults()
 
 def _init_embed_cache(path: str):
     conn = sqlite3.connect(path, check_same_thread=False)
@@ -249,18 +318,50 @@ def _init_embed_cache(path: str):
 _init_embed_cache(st.session_state.embed_cache_path)
 
 # ---------------------------
+# Load persisted indexes (if any) on startup/refresh
+# ---------------------------
+def try_load_persisted_indexes():
+    if os.path.isdir(POLICY_DIR) and not st.session_state.get("policy_index"):
+        try:
+            sc = StorageContext.from_defaults(persist_dir=POLICY_DIR)
+            st.session_state.policy_index = load_index_from_storage(sc)
+        except Exception as e:
+            st.warning(f"Could not load persisted policy index: {e}")
+
+    if os.path.isdir(EMAIL_DIR) and not st.session_state.get("email_index"):
+        try:
+            sc = StorageContext.from_defaults(persist_dir=EMAIL_DIR)
+            st.session_state.email_index = load_index_from_storage(sc)
+        except Exception as e:
+            st.warning(f"Could not load persisted prior responses index: {e}")
+
+    st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
+
+try_load_persisted_indexes()
+
+# ---------------------------
 # Uploaders
 # ---------------------------
 policy_files = st.file_uploader(
-    "Upload Company Policy documents (PDF/DOCX/TXT)",
-    type=["pdf", "docx", "txt"],
+    "Upload Company Policy documents (PDF/DOCX/TXT/XLSX/CSV)",
+    type=["pdf", "docx", "txt", "xlsx", "xls", "csv"],
     accept_multiple_files=True
 )
 email_files = st.file_uploader(
-    "Upload Prior Regulator Response emails (PDF/DOCX/TXT)",
-    type=["pdf", "docx", "txt"],
+    "Upload Prior Regulator Response emails (PDF/DOCX/TXT/XLSX/CSV)",
+    type=["pdf", "docx", "txt", "xlsx", "xls", "csv"],
     accept_multiple_files=True
 )
+
+def _persist_uploaded_file(name: str, data: bytes):
+    safe_name = f"{hashlib.sha1(name.encode()).hexdigest()}__{name}"
+    save_path = os.path.join(FILES_ROOT, safe_name)
+    try:
+        with open(save_path, "wb") as f:
+            f.write(data)
+        st.session_state.saved_file_paths[name] = save_path
+    except Exception:
+        pass
 
 def add_to_docs(files, target_list, corpus_name: str):
     for f in files:
@@ -287,6 +388,8 @@ def add_to_docs(files, target_list, corpus_name: str):
                 target_list.append(Document(text=txt, metadata={"source": name, "page": page_num}))
             st.session_state.file_bytes_map[name] = data
             st.session_state.pdf_page_texts[name] = {p: t for p, t in pages}
+            _persist_uploaded_file(name, data)
+
         elif lower.endswith(".docx"):
             txt = read_docx(data)
             if not txt.strip():
@@ -294,6 +397,8 @@ def add_to_docs(files, target_list, corpus_name: str):
                 continue
             target_list.append(Document(text=txt, metadata={"source": name}))
             st.session_state.file_bytes_map[name] = data
+            _persist_uploaded_file(name, data)
+
         elif lower.endswith(".txt"):
             txt = read_txt(data)
             if not txt.strip():
@@ -301,6 +406,42 @@ def add_to_docs(files, target_list, corpus_name: str):
                 continue
             target_list.append(Document(text=txt, metadata={"source": name}))
             st.session_state.file_bytes_map[name] = data
+            _persist_uploaded_file(name, data)
+
+        elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+            try:
+                rows = read_excel_rows(data)
+            except Exception as e:
+                st.warning(f"Failed to read Excel {name}: {e}")
+                continue
+            if not rows:
+                st.warning(f"No usable rows found in {name}")
+                continue
+            for sheet, rownum, row_dict in rows:
+                doc_text = row_dict_to_text(row_dict)
+                row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
+                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key}
+                target_list.append(Document(text=doc_text, metadata=meta))
+            st.session_state.file_bytes_map[name] = data
+            _persist_uploaded_file(name, data)
+
+        elif lower.endswith(".csv"):
+            try:
+                rows = read_csv_rows(data)
+            except Exception as e:
+                st.warning(f"Failed to read CSV {name}: {e}")
+                continue
+            if not rows:
+                st.warning(f"No usable rows found in {name}")
+                continue
+            for sheet, rownum, row_dict in rows:
+                doc_text = row_dict_to_text(row_dict)
+                row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
+                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key}
+                target_list.append(Document(text=doc_text, metadata=meta))
+            st.session_state.file_bytes_map[name] = data
+            _persist_uploaded_file(name, data)
+
         else:
             st.warning(f"Unsupported file type: {name}")
             continue
@@ -317,15 +458,23 @@ if email_files:
     add_to_docs(email_files, st.session_state.email_docs, "email")
 
 # ---------------------------
+# Storage status
+# ---------------------------
+if st.session_state.policy_index or st.session_state.email_index:
+    st.success("✅ Loaded existing indexes from local storage (or current session). You can ask questions immediately.")
+else:
+    st.info("ℹ️ No indexes found in local storage yet. Upload documents and build indexes to get started.")
+
+# ---------------------------
 # Unique counters (no creep)
 # ---------------------------
 colA, colB = st.columns(2)
 with colA:
     if st.session_state.policy_loaded_hashes:
-        st.success(f"Policy docs loaded: {len(st.session_state.policy_loaded_hashes)}")
+        st.success(f"Policy docs loaded (this session): {len(st.session_state.policy_loaded_hashes)}")
 with colB:
     if st.session_state.email_loaded_hashes:
-        st.success(f"Prior response docs loaded: {len(st.session_state.email_loaded_hashes)}")
+        st.success(f"Prior response docs loaded (this session): {len(st.session_state.email_loaded_hashes)}")
 
 # ---------------------------
 # Embedding cache helpers (JSON-safe; ndarray -> list[float])
@@ -377,7 +526,7 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ---------------------------
-# Build indexes — pre-embedded + cached (docstore-first write)
+# Build indexes — pre-embedded + cached (docstore-first write) + persist
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -392,13 +541,18 @@ def build_index_incremental_preembedded_cached(
       - Hash full normalized chunk text for caching
       - Cache hits/misses + optional per-batch debug timings
       - Store nodes in DOCSTORE first, then vector store (prevents KeyError)
+      - Persist storage to disk (policy/email)
     """
     # Prepare explicit docstore + vector store
     docstore = SimpleDocumentStore()
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(docstore=docstore, vector_store=vector_store)
     if not docs:
-        return VectorStoreIndex([], storage_context=storage_context)
+        index = VectorStoreIndex([], storage_context=storage_context)
+        # still persist an empty storage to keep directory structure valid
+        persist_dir = POLICY_DIR if "policy" in label.lower() else EMAIL_DIR
+        index.storage_context.persist(persist_dir=persist_dir)
+        return index
 
     def _dummy_text() -> str:
         return ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 50).strip()
@@ -504,13 +658,17 @@ def build_index_incremental_preembedded_cached(
             expanded=False
         )
 
-    return VectorStoreIndex([], storage_context=storage_context)
+    # Bind index to storage and persist to disk
+    index = VectorStoreIndex([], storage_context=storage_context)
+    persist_dir = POLICY_DIR if "policy" in label.lower() else EMAIL_DIR
+    index.storage_context.persist(persist_dir=persist_dir)
+    return index
 
 # ---------------------------
-# Helper: ensure indexes exist (lazy build)
+# Helper: ensure indexes exist (lazy build); consider persisted storage
 # ---------------------------
 def ensure_indexes_built() -> bool:
-    """Build indexes if missing and docs are loaded. Return True if at least one index exists."""
+    try_load_persisted_indexes()
     need_policy = st.session_state.policy_index is None and bool(st.session_state.policy_docs)
     need_email  = st.session_state.email_index  is None and bool(st.session_state.email_docs)
 
@@ -541,8 +699,8 @@ def ensure_indexes_built() -> bool:
 # Build / Rebuild Indexes button
 # ---------------------------
 if st.button("🔧 Build / Rebuild Indexes"):
-    if not st.session_state.policy_docs and not st.session_state.email_docs:
-        st.error("Please upload at least one document.")
+    if (not st.session_state.policy_docs and not st.session_state.email_docs) and not st.session_state.vector_ready:
+        st.error("Please upload at least one document (or rely on persisted indexes already loaded).")
     else:
         with st.spinner("Preparing to build indexes…"):
             configure_settings()
@@ -555,8 +713,6 @@ if st.button("🔧 Build / Rebuild Indexes"):
                 api_batch_size=embed_api_batch,
                 max_tokens_unused=0,  # ignored
             )
-        else:
-            st.session_state.policy_index = None
 
         if st.session_state.email_docs:
             st.session_state.email_index = build_index_incremental_preembedded_cached(
@@ -566,14 +722,12 @@ if st.button("🔧 Build / Rebuild Indexes"):
                 api_batch_size=embed_api_batch,
                 max_tokens_unused=0,  # ignored
             )
-        else:
-            st.session_state.email_index = None
 
         st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
         if st.session_state.vector_ready:
-            st.success("Indexes built.")
+            st.success("Indexes built and persisted.")
         else:
-            st.warning("No indexes available (no documents loaded).")
+            st.info("No new documents to build. Using existing persisted indexes if available.")
 
 # ---------------------------
 # Prompts
@@ -749,16 +903,25 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
 
     for i, nws in enumerate(nodes_ws):
         node = nws.node
-        src = (node.metadata or {}).get("source", "unknown")
-        page = (node.metadata or {}).get("page")
+        md = node.metadata or {}
+        src  = md.get("source", "unknown")
+        page = md.get("page")
+        sheet = md.get("sheet")
+        row = md.get("row")
+        row_key = md.get("row_key")
         if page is not None:
             tag = f"[Doc: {src}, Page {page}, Node {i}]"
+        elif sheet is not None and row is not None:
+            if row_key:
+                tag = f"[Doc: {src}, Sheet {sheet}, Row {row}, Key {row_key}, Node {i}]"
+            else:
+                tag = f"[Doc: {src}, Sheet {sheet}, Row {row}, Node {i}]"
         else:
             tag = f"[Doc: {src}, Node {i}]"
         text = re.sub(r"\s+", " ", node.get_text()).strip()
         evidence_lines.append(f"{tag} {text}")
         tag_to_file[tag] = src
-        tag_to_page[tag] = page
+        tag_to_page[tag] = page  # may be None for Excel/CSV
         try:
             tag_to_score[tag] = float(nws.score or 0.0)
         except Exception:
@@ -790,10 +953,9 @@ q_table = st.data_editor(
 # Generate Responses (lazy-build if needed)
 # ---------------------------
 if st.button("🧠 Generate Responses"):
-    # loader/status so users know work is running
     ready = ensure_indexes_built()
     if not ready:
-        st.error("No indexes available. Upload documents and build indexes first (or re-upload so I can rebuild from cache).")
+        st.error("No indexes available. Upload documents and build indexes first (or rely on persisted indexes).")
         st.stop()
 
     configure_settings()
@@ -853,7 +1015,7 @@ if st.button("🧠 Generate Responses"):
                     else:
                         for line in lines[:4]:
                             ev_snips.append(line)
-                            m = re.search(r"\[Doc: (.*?)(?:, Page \d+)?, Node \d+\]", line)
+                            m = re.search(r"\[Doc: (.*?)(?:, Page \d+|, Sheet .*?, Row \d+(?:, Key [^,]+)?)*, Node \d+\]", line)
                             if m:
                                 kept_docs.append(m.group(1))
                 kept_docs = list(dict.fromkeys(kept_docs))[:5]
@@ -903,40 +1065,121 @@ if st.button("🧠 Generate Responses"):
                             query_text = query_text[:500]
 
                         with st.expander("Show evidence"):
-                            if fname and page and fname in st.session_state.file_bytes_map:
-                                file_bytes = st.session_state.file_bytes_map[fname]
-                                img = render_pdf_page_with_highlight(file_bytes, page, query_text)
-                                if img is not None:
-                                    st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
-                                else:
-                                    page_text = ""
-                                    if fname in st.session_state.pdf_page_texts:
-                                        page_text = st.session_state.pdf_page_texts[fname].get(page, "")
-                                    if page_text:
-                                        safe_html = highlight_html(page_text, query_text, window=600)
-                                        st.markdown(f"**{fname} — Page {page} (text preview)**", help="Install pymupdf+Pillow for image previews.")
-                                        st.markdown(safe_html, unsafe_allow_html=True)
+                            # PDF preview
+                            if fname and page and fname.lower().endswith(".pdf"):
+                                # try in-memory; fallback to disk
+                                data = st.session_state.file_bytes_map.get(fname)
+                                if data is None:
+                                    p = st.session_state.saved_file_paths.get(fname)
+                                    if p and os.path.isfile(p):
+                                        with open(p, "rb") as fh:
+                                            data = fh.read()
+                                if data:
+                                    img = render_pdf_page_with_highlight(data, page, query_text)
+                                    if img is not None:
+                                        st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
                                     else:
-                                        st.info("Preview unavailable for this PDF page.")
+                                        # text-only fallback
+                                        page_text = ""
+                                        if fname in st.session_state.pdf_page_texts:
+                                            page_text = st.session_state.pdf_page_texts[fname].get(page, "")
+                                        if not page_text and data:
+                                            # rebuild lazily
+                                            try:
+                                                pages = read_pdf_pages(data)
+                                                st.session_state.pdf_page_texts[fname] = {p: t for p, t in pages}
+                                                page_text = st.session_state.pdf_page_texts[fname].get(page, "")
+                                            except Exception:
+                                                page_text = ""
+                                        if page_text:
+                                            safe_html = highlight_html(page_text, query_text, window=600)
+                                            st.markdown(f"**{fname} — Page {page} (text preview)**")
+                                            st.markdown(safe_html, unsafe_allow_html=True)
+                                        else:
+                                            st.info("Preview unavailable for this PDF page.")
+                                else:
+                                    st.info("Preview unavailable for this evidence.")
+
+                            # Excel/CSV preview (exact row)
+                            elif fname and (fname.lower().endswith(".xlsx") or fname.lower().endswith(".xls") or fname.lower().endswith(".csv")):
+                                m = re.search(r"Sheet (.*?), Row (\d+)", tag)
+                                sheet_name = None
+                                row_num = None
+                                if m:
+                                    sheet_name = m.group(1).strip()
+                                    try:
+                                        row_num = int(m.group(2))
+                                    except Exception:
+                                        row_num = None
+
+                                data = st.session_state.file_bytes_map.get(fname)
+                                if data is None:
+                                    p = st.session_state.saved_file_paths.get(fname)
+                                    if p and os.path.isfile(p):
+                                        with open(p, "rb") as fh:
+                                            data = fh.read()
+
+                                if data:
+                                    try:
+                                        if fname.lower().endswith(".csv"):
+                                            df = pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
+                                        else:
+                                            if sheet_name:
+                                                df = pd.read_excel(io.BytesIO(data), sheet_name=sheet_name, dtype=str).fillna("")
+                                            else:
+                                                xl = pd.ExcelFile(io.BytesIO(data))
+                                                df = pd.read_excel(xl, sheet_name=xl.sheet_names[0], dtype=str).fillna("")
+                                        if row_num and 1 <= row_num <= len(df):
+                                            st.markdown(f"**{fname} — {('Sheet ' + sheet_name + ', ') if sheet_name else ''}Row {row_num}**")
+                                            st.dataframe(df.iloc[[row_num - 1]], use_container_width=True)
+                                        else:
+                                            st.markdown(f"**{fname} — preview**")
+                                            st.dataframe(df.head(10), use_container_width=True)
+                                    except Exception as e:
+                                        st.info(f"Preview unavailable for this table: {e}")
+                                else:
+                                    st.info("Preview unavailable for this evidence.")
+
+                            # DOCX/TXT or unknown → text preview
                             else:
                                 src_file = fname or "(unknown)"
                                 data = st.session_state.file_bytes_map.get(src_file)
+                                if data is None:
+                                    p = st.session_state.saved_file_paths.get(src_file)
+                                    if p and os.path.isfile(p):
+                                        with open(p, "rb") as fh:
+                                            data = fh.read()
+
                                 preview_text = ""
-                                if data:
+                                if data and src_file:
                                     lower = src_file.lower()
                                     try:
                                         if lower.endswith(".pdf"):
                                             if src_file in st.session_state.pdf_page_texts:
                                                 preview_text = " ".join(st.session_state.pdf_page_texts[src_file].values())
+                                            else:
+                                                pages = read_pdf_pages(data)
+                                                st.session_state.pdf_page_texts[src_file] = {p: t for p, t in pages}
+                                                preview_text = " ".join(t for _, t in pages)
                                         elif lower.endswith(".docx"):
                                             preview_text = read_docx(data)
                                         elif lower.endswith(".txt"):
                                             preview_text = read_txt(data)
+                                        else:
+                                            # excel/csv without sheet/row info in tag
+                                            if lower.endswith(".csv"):
+                                                df = pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
+                                                preview_text = df.head(10).to_csv(index=False)
+                                            elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+                                                xl = pd.ExcelFile(io.BytesIO(data))
+                                                df = pd.read_excel(xl, sheet_name=xl.sheet_names[0], dtype=str).fillna("")
+                                                preview_text = df.head(10).to_csv(index=False)
                                     except Exception:
                                         preview_text = ""
+
                                 if preview_text:
                                     safe_html = highlight_html(preview_text, query_text, window=600)
-                                    st.markdown(f"**{src_file} (text preview)**")
+                                    st.markdown(f"**{src_file} (text/table preview)**")
                                     st.markdown(safe_html, unsafe_allow_html=True)
                                 else:
                                     st.info("Preview unavailable for this evidence.")
