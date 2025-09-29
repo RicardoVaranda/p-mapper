@@ -2,7 +2,10 @@
 # -------------------------------------------------------------------------
 # Upload Policy docs & Prior Regulator Responses (PDF/DOCX/TXT/XLSX/CSV)
 # Ask regulator questions → evidence-backed drafts + citations
-# Chunking-only (no tokenizers). JSON-safe embed cache. Persistent indexes & files.
+# Chunking-only for PDFs/DOCX/TXT; Excel/CSV: ONE ROW = ONE NODE/EMBEDDING.
+# JSON-safe embed cache. Persistent indexes & files. Visual PDF & row previews.
+# Confidence scoring: multi-signal (similarity, coverage, diversity, alignment via rapidfuzz, corpus weight),
+# blended with judge confidence.
 
 import os
 import io
@@ -18,6 +21,7 @@ import streamlit as st
 import pandas as pd
 import docx2txt
 from PyPDF2 import PdfReader
+from rapidfuzz import fuzz  # for alignment scoring
 
 # Optional preview backends (visual PDF previews)
 try:
@@ -78,7 +82,7 @@ with st.sidebar:
 
     # Embedding performance controls
     st.markdown("### Embedding Performance")
-    embed_page_batch = st.slider("Embed page batch (pages → nodes)", 2, 64, 16, 2)
+    embed_page_batch = st.slider("Embed page batch (pages/rows → nodes)", 2, 64, 16, 2)
     embed_api_batch  = st.slider("Embed API batch (texts per request)", 4, 128, 32, 4)
 
     # kept only for UI continuity; unused in chunking-only mode
@@ -118,7 +122,7 @@ def configure_settings():
         api_key=api_key or None,
         base_url=base_url or None
     )
-    # Chunking controls node size; no truncation used.
+    # Chunking controls node size; no truncation used for non-row docs.
     Settings.node_parser = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
 configure_settings()
@@ -420,7 +424,10 @@ def add_to_docs(files, target_list, corpus_name: str):
             for sheet, rownum, row_dict in rows:
                 doc_text = row_dict_to_text(row_dict)
                 row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
-                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key}
+                meta = {
+                    "source": name, "sheet": sheet, "row": rownum, "row_key": row_key,
+                    "row_node": True, "headers": list(row_dict.keys())
+                }
                 target_list.append(Document(text=doc_text, metadata=meta))
             st.session_state.file_bytes_map[name] = data
             _persist_uploaded_file(name, data)
@@ -437,7 +444,10 @@ def add_to_docs(files, target_list, corpus_name: str):
             for sheet, rownum, row_dict in rows:
                 doc_text = row_dict_to_text(row_dict)
                 row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
-                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key}
+                meta = {
+                    "source": name, "sheet": sheet, "row": rownum, "row_key": row_key,
+                    "row_node": True, "headers": list(row_dict.keys())
+                }
                 target_list.append(Document(text=doc_text, metadata=meta))
             st.session_state.file_bytes_map[name] = data
             _persist_uploaded_file(name, data)
@@ -526,7 +536,9 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ---------------------------
-# Build indexes — pre-embedded + cached (docstore-first write) + persist
+# Build indexes — cached embeddings, docstore-first, persist
+# - Excel/CSV: ONE ROW = ONE NODE (no splitting)
+# - Other docs: chunk via SentenceSplitter
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -537,10 +549,10 @@ def build_index_incremental_preembedded_cached(
 ) -> VectorStoreIndex:
     """
     Build a VectorStoreIndex from documents:
-      - Page-by-page nodes via SentenceSplitter (chunking-only; no truncation)
-      - Hash full normalized chunk text for caching
-      - Cache hits/misses + optional per-batch debug timings
-      - Store nodes in DOCSTORE first, then vector store (prevents KeyError)
+      - Excel/CSV rows become individual TextNodes (one embedding per row)
+      - Other docs chunked via SentenceSplitter
+      - Embeddings cached in SQLite by hash of normalized text
+      - Docstore-first write, then vector store
       - Persist storage to disk (policy/email)
     """
     # Prepare explicit docstore + vector store
@@ -549,7 +561,6 @@ def build_index_incremental_preembedded_cached(
     storage_context = StorageContext.from_defaults(docstore=docstore, vector_store=vector_store)
     if not docs:
         index = VectorStoreIndex([], storage_context=storage_context)
-        # still persist an empty storage to keep directory structure valid
         persist_dir = POLICY_DIR if "policy" in label.lower() else EMAIL_DIR
         index.storage_context.persist(persist_dir=persist_dir)
         return index
@@ -558,13 +569,13 @@ def build_index_incremental_preembedded_cached(
         return ("lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 50).strip()
 
     parser = Settings.node_parser
-    total_pages = len(docs)
+    total_items = len(docs)
     db_path = st.session_state.embed_cache_path
 
     DBG_PING_BATCHES = 3
     DBG_PING_BATCH_SIZE = 16
 
-    with st.status(f"Embedding {label} ({total_pages} pages)…", state="running", expanded=True) as status:
+    with st.status(f"Embedding {label} ({total_items} docs/pages/rows)…", state="running", expanded=True) as status:
         outer_pb = st.progress(0.0)
         t0_all = time.time()
         total_nodes = total_hits = total_miss = 0
@@ -589,10 +600,29 @@ def build_index_incremental_preembedded_cached(
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
 
-            for i in range(0, total_pages, page_batch_size):
+            for i in range(0, total_items, page_batch_size):
                 batch_docs = docs[i:i+page_batch_size]
-                nodes: List[TextNode] = parser.get_nodes_from_documents(batch_docs)
 
+                # Build nodes:
+                #   - Excel/CSV rows (metadata.row_node=True): one node per doc, with stable id
+                #   - Others: chunk via parser
+                nodes: List[TextNode] = []
+                row_docs = [d for d in batch_docs if (d.metadata or {}).get("row_node")]
+                other_docs = [d for d in batch_docs if not (d.metadata or {}).get("row_node")]
+
+                for d in row_docs:
+                    txt = d.get_text()
+                    md = d.metadata or {}
+                    node_id = hashlib.sha1(
+                        (md.get("source","") + "|" + str(md.get("sheet","")) + "|" + str(md.get("row","")) + "|" + txt).encode("utf-8")
+                    ).hexdigest()[:32]
+                    n = TextNode(text=txt, metadata=md, id_=node_id)
+                    nodes.append(n)
+
+                if other_docs:
+                    nodes.extend(parser.get_nodes_from_documents(other_docs))
+
+                # Embed with cache
                 texts, hashes = [], []
                 for n in nodes:
                     raw = n.get_content(metadata_mode="none")
@@ -634,7 +664,7 @@ def build_index_incremental_preembedded_cached(
                     vec = cache_map.get(h) or new_items.get(h)
                     n.embedding = _as_float_list(vec) if vec is not None else None
 
-                # ✅ write to DOCSTORE first, then vector store (prevents KeyError on retrieve)
+                # ✅ write to DOCSTORE first, then vector store
                 storage_context.docstore.add_documents(nodes)
                 vector_store.add(nodes)
 
@@ -642,10 +672,10 @@ def build_index_incremental_preembedded_cached(
                 total_hits  += hits
                 total_miss  += len(miss_texts)
 
-                pages_done = min(total_pages, i + len(batch_docs))
-                outer_pb.progress(min(1.0, pages_done / total_pages))
+                items_done = min(total_items, i + len(batch_docs))
+                outer_pb.progress(min(1.0, items_done / total_items))
                 status.write(
-                    f"Progress: pages {pages_done}/{total_pages} | nodes: {total_nodes} | "
+                    f"Progress: items {items_done}/{total_items} | nodes: {total_nodes} | "
                     f"cache hits: {total_hits} | misses: {total_miss}"
                 )
         finally:
@@ -755,7 +785,7 @@ Rules:
 - Return ONLY a single JSON object. No commentary, no markdown, no code fences.
 - JSON must be minified on one line.
 - Use these exact keys: source_type, confidence, keep_citations.
-- source_type ∈ {{"Policy","PriorEmail","Blended","Insufficient"}}.
+- source_type ∈ {"Policy","PriorEmail","Blended","Insufficient"}.
 - confidence is a float 0.0–1.0 (use one decimal place).
 - keep_citations is an array of strings; each string must exactly match a citation tag from Evidence.
 
@@ -768,11 +798,11 @@ Evidence:
 {evidence}
 
 Return:
-{{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}}
+{"source_type":"Policy","confidence":0.8,"keep_citations":["[Doc: sample.pdf, Node 0]","[Doc: prior_email.txt, Node 2]"]}
 """
 
 # ---------------------------
-# Robust JSON extraction + fallback helpers
+# JSON extraction + source typing
 # ---------------------------
 def extract_first_json_obj(s: str) -> Optional[dict]:
     if not s:
@@ -808,14 +838,94 @@ def infer_source_type_from_tags(tags: List[str], tag_to_file: Dict[str, str]) ->
         return "PriorEmail"
     return "Insufficient"
 
-def confidence_from_scores(tag_to_score: Dict[str, float], kept_tags: List[str]) -> float:
-    use_tags = kept_tags or list(tag_to_score.keys())
-    scores = [tag_to_score.get(t, 0.0) for t in use_tags]
-    if not scores:
+# ---------------------------
+# Rich, blended confidence scoring
+# ---------------------------
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+def compute_confidence(
+    question: str,
+    draft: str,
+    tag_to_score: Dict[str, float],
+    kept_tags: List[str],
+    tag_to_file: Dict[str, str],
+    ev_str: str,
+    source_type: str,
+) -> float:
+    """
+    Heuristic confidence in [0,1] combining:
+      - similarity strength (weighted top scores)
+      - citation coverage (#kept)
+      - source diversity (distinct docs)
+      - alignment: draft↔evidence & question↔evidence (rapidfuzz)
+      - corpus weight (Policy > Blended > PriorEmail > Insufficient)
+    """
+    if not ev_str or ev_str.strip() == "(no evidence found)":
         return 0.0
-    clipped = [min(1.0, max(0.0, float(s))) for s in scores]
-    avg = sum(clipped) / len(clipped)
-    return round(max(0.05, min(0.99, avg)), 3)
+
+    pairs = sorted(tag_to_score.items(), key=lambda kv: kv[1], reverse=True)
+    if kept_tags:
+        kept_scored = [(t, tag_to_score.get(t, 0.0)) for t in kept_tags]
+        extra = [p for p in pairs if p[0] not in kept_tags]
+        pairs = kept_scored + extra
+
+    # similarity strength: normalize scores roughly and weight top-3
+    top = [p[1] for p in pairs[:3]] if pairs else []
+    def norm_sim(s):
+        return _clamp01((s - 0.4) / (0.85 - 0.4)) if isinstance(s, (int, float)) else 0.0
+    top_n = [norm_sim(s) for s in top]
+    weights = [1.0, 0.7, 0.5][:len(top_n)]
+    sim_strength = _clamp01(sum(w*s for w, s in zip(weights, top_n)) / (sum(weights) or 1.0))
+
+    # coverage & diversity
+    k = len(kept_tags)
+    coverage = _clamp01(k / 4.0)  # saturate at 4 citations
+    kept_docs = {tag_to_file.get(t, "") for t in kept_tags if t in tag_to_file}
+    diversity = _clamp01(len([d for d in kept_docs if d]) / max(1.0, k)) if k else 0.0
+
+    # alignment via rapidfuzz (use kept evidence text)
+    ev_lines = ev_str.splitlines()
+    ev_map = {}
+    for line in ev_lines:
+        if "]" in line:
+            tag = line.split("]")[0] + "]"
+            ev_map[tag] = line[len(tag):].strip()
+    if kept_tags:
+        kept_text = "\n".join(ev_map.get(t, "") for t in kept_tags)
+    else:
+        kept_text = "\n".join((ev_lines[i] if i < len(ev_lines) else "") for i in range(min(3, len(ev_lines))))
+
+    def rf(s1: str, s2: str) -> float:
+        if not s1 or not s2:
+            return 0.0
+        return _clamp01(fuzz.partial_ratio(s1, s2) / 100.0)
+
+    align_draft = rf(draft, kept_text)
+    align_question = rf(question, kept_text)
+    alignment = 0.6 * align_draft + 0.4 * align_question
+
+    # corpus weight
+    corpus_weight = {
+        "Policy": 0.95,
+        "Blended": 0.9,
+        "PriorEmail": 0.8,
+        "Insufficient": 0.2,
+    }.get(source_type or "Insufficient", 0.2)
+
+    raw = (
+        0.45 * sim_strength +
+        0.30 * alignment +
+        0.15 * coverage +
+        0.10 * diversity
+    )
+    raw = raw * (0.85 + 0.15 * corpus_weight)
+
+    if k > 0 and raw > 0.02:
+        return round(_clamp01(max(0.05, min(0.99, raw))), 3)
+    if tag_to_score and raw > 0.02:
+        return round(max(0.03, min(0.4, raw * 0.6)), 3)
+    return 0.0
 
 # ---------------------------
 # Resilient retrieval with direct-query fallback + auto-repair
@@ -918,8 +1028,13 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
                 tag = f"[Doc: {src}, Sheet {sheet}, Row {row}, Node {i}]"
         else:
             tag = f"[Doc: {src}, Node {i}]"
+
+        # Optional: add a tiny header hint (first 3 columns) to the snippet text (not the tag)
+        headers = md.get("headers")
+        header_hint = f" | Columns: {', '.join(headers[:3])}" if isinstance(headers, list) and headers else ""
+
         text = re.sub(r"\s+", " ", node.get_text()).strip()
-        evidence_lines.append(f"{tag} {text}")
+        evidence_lines.append(f"{tag} {text}{header_hint}")
         tag_to_file[tag] = src
         tag_to_page[tag] = page  # may be None for Excel/CSV
         try:
@@ -993,14 +1108,25 @@ if st.button("🧠 Generate Responses"):
                     source_type = parsed.get("source_type", "Insufficient")
                     keep = [str(x) for x in parsed.get("keep_citations", [])]
                     try:
-                        confidence = float(parsed.get("confidence", 0.0))
+                        judge_conf = float(parsed.get("confidence", 0.0))
                     except Exception:
-                        confidence = 0.0
+                        judge_conf = 0.0
                 else:
                     sorted_tags = sorted(tag2score.items(), key=lambda kv: kv[1], reverse=True)
                     keep = [t for (t, _) in sorted_tags[:3]]
                     source_type = infer_source_type_from_tags(keep, tag2file)
-                    confidence = confidence_from_scores(tag2score, keep)
+                    judge_conf = 0.0
+
+                # Our computed confidence from multiple signals
+                comp_conf = compute_confidence(q, draft, tag2score, keep, tag2file, ev_str, source_type)
+
+                # Blend judge with computed
+                if judge_conf <= 0.0:
+                    confidence = comp_conf
+                else:
+                    hi = max(judge_conf, comp_conf)
+                    lo = min(judge_conf, comp_conf)
+                    confidence = round(_clamp01(0.65 * hi + 0.35 * lo), 3)
 
                 ev_snips, kept_docs = [], []
                 if ev_str != "(no evidence found)":
@@ -1067,7 +1193,6 @@ if st.button("🧠 Generate Responses"):
                         with st.expander("Show evidence"):
                             # PDF preview
                             if fname and page and fname.lower().endswith(".pdf"):
-                                # try in-memory; fallback to disk
                                 data = st.session_state.file_bytes_map.get(fname)
                                 if data is None:
                                     p = st.session_state.saved_file_paths.get(fname)
@@ -1079,12 +1204,10 @@ if st.button("🧠 Generate Responses"):
                                     if img is not None:
                                         st.image(img, caption=f"{fname} — Page {page}", use_column_width=True)
                                     else:
-                                        # text-only fallback
                                         page_text = ""
                                         if fname in st.session_state.pdf_page_texts:
                                             page_text = st.session_state.pdf_page_texts[fname].get(page, "")
                                         if not page_text and data:
-                                            # rebuild lazily
                                             try:
                                                 pages = read_pdf_pages(data)
                                                 st.session_state.pdf_page_texts[fname] = {p: t for p, t in pages}
