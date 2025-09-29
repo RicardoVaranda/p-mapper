@@ -36,7 +36,6 @@ import io
 import re
 import json
 import uuid
-import time
 import shutil
 import hashlib
 import typing as t
@@ -51,6 +50,7 @@ import docx2txt
 from llama_index.core import Document, VectorStoreIndex, Settings
 from llama_index.core import StorageContext, load_index_from_storage
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import TextNode
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 
@@ -107,13 +107,13 @@ def configure_settings():
         kw["base_url"] = base_url
     Settings.llm = OpenAI(model=chat_model, api_key=api_key or None, **kw)
     Settings.embed_model = OpenAIEmbedding(model=embed_model, api_key=api_key or None, base_url=base_url or None)
-    # deterministic chunking
+    # deterministic chunking for non-row docs; rows become single TextNodes
     Settings.node_parser = SentenceSplitter(chunk_size=1000, chunk_overlap=150)
 
 configure_settings()
 
 # ---------------------------
-# Read files → Documents (page‑aware for PDFs)
+# Read files → Documents (page‑aware for PDFs, row‑aware for Excel/CSV)
 # ---------------------------
 
 def read_pdf_pages(file_bytes: bytes) -> list[tuple[int, str]]:
@@ -146,6 +146,53 @@ def read_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="ignore")
 
 
+def read_excel_rows(file_bytes: bytes) -> list[tuple[str, int, dict]]:
+    """Return list of (sheet_name, row_index_1based, ordered_row_dict)."""
+    out: list[tuple[str, int, dict]] = []
+    bio = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+        if df.empty:
+            continue
+        df = df.fillna("")
+        cols = [str(c) for c in df.columns]
+        for ridx, row in df.iterrows():
+            row_dict: dict[str, str] = {}
+            for c in cols:
+                v = str(row[c]).strip()
+                if v != "":
+                    row_dict[c] = v
+            if not row_dict:
+                continue
+            out.append((sheet, int(ridx) + 1, row_dict))
+    return out
+
+
+def read_csv_rows(file_bytes: bytes) -> list[tuple[str, int, dict]]:
+    out: list[tuple[str, int, dict]] = []
+    bio = io.BytesIO(file_bytes)
+    df = pd.read_csv(bio, dtype=str)
+    if df.empty:
+        return out
+    df = df.fillna("")
+    cols = [str(c) for c in df.columns]
+    for ridx, row in df.iterrows():
+        row_dict: dict[str, str] = {}
+        for c in cols:
+            v = str(row[c]).strip()
+            if v != "":
+                row_dict[c] = v
+        if not row_dict:
+            continue
+        out.append(("CSV", int(ridx) + 1, row_dict))
+    return out
+
+
+def row_dict_to_text(row: dict[str, str]) -> str:
+    return "\n".join(f"{k}: {v}" for k, v in row.items())
+
+
 def files_to_docs(files: list, kind: str) -> list[dict]:
     docs: list[dict] = []
     for f in files or []:
@@ -166,6 +213,32 @@ def files_to_docs(files: list, kind: str) -> list[dict]:
             txt = read_txt(data)
             if txt.strip():
                 docs.append({"text": txt, "metadata": {"source": name, "type": kind}})
+        elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+            try:
+                rows = read_excel_rows(data)
+            except Exception as e:
+                st.warning(f"Failed to read Excel {name}: {e}")
+                rows = []
+            for sheet, rownum, row_dict in rows:
+                txt = row_dict_to_text(row_dict)
+                if not txt.strip():
+                    continue
+                row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
+                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key, "headers": list(row_dict.keys()), "type": kind, "row_node": True}
+                docs.append({"text": txt, "metadata": meta})
+        elif lower.endswith(".csv"):
+            try:
+                rows = read_csv_rows(data)
+            except Exception as e:
+                st.warning(f"Failed to read CSV {name}: {e}")
+                rows = []
+            for sheet, rownum, row_dict in rows:
+                txt = row_dict_to_text(row_dict)
+                if not txt.strip():
+                    continue
+                row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
+                meta = {"source": name, "sheet": sheet, "row": rownum, "row_key": row_key, "headers": list(row_dict.keys()), "type": kind, "row_node": True}
+                docs.append({"text": txt, "metadata": meta})
         else:
             st.warning(f"Unsupported file type: {name}")
     return docs
@@ -187,8 +260,10 @@ def _fingerprint_docs(docs: list[dict]) -> str:
         md = d.get("metadata", {}) or {}
         src = md.get("source", "")
         pg  = str(md.get("page", ""))
-        h.update((src + "|" + pg + "\x1e").encode("utf-8", "ignore"))
-        h.update(((d.get("text", "") or "") + "\x1e").encode("utf-8", "ignore"))
+        sheet = md.get("sheet", "")
+        row = str(md.get("row", ""))
+        h.update(f"{src}|{pg}|{sheet}|{row}|SEP|".encode("utf-8", "ignore"))
+        h.update(((d.get("text", "") or "") + "|SEP|TEXT").encode("utf-8", "ignore"))
     h.update(("embed=" + (embed_model or "default")).encode("utf-8"))
     return h.hexdigest()
 
@@ -196,7 +271,9 @@ def _fingerprint_docs(docs: list[dict]) -> str:
 def build_or_load_index_persisted(
     docs: list[dict], *, prefix: str, persist_root: str
 ) -> IndexedCorpus:
-    """Load a VectorStoreIndex from disk if present; else build and persist."""
+    """Load a VectorStoreIndex from disk if present; else build and persist.
+       Ensures: Excel/CSV rows become **single TextNodes** (one chunk per row).
+    """
     li_docs = [Document(text=d.get("text", ""), metadata=d.get("metadata", {})) for d in docs]
     if not docs:
         return IndexedCorpus(index=None, raw_docs=li_docs, loaded_from_cache=False)
@@ -213,9 +290,26 @@ def build_or_load_index_persisted(
     except Exception:
         pass
 
-    # Build & persist
+    # Build nodes explicitly: rows → TextNode (no re‑chunk), others → parser chunks
     configure_settings()
-    idx = VectorStoreIndex.from_documents(li_docs)
+    row_nodes: list[TextNode] = []
+    other_docs: list[Document] = []
+    for d in li_docs:
+        md = d.metadata or {}
+        if md.get("row_node"):
+            # stable id from (source|sheet|row|text)
+            node_id = hashlib.sha1((md.get("source","") + "|" + str(md.get("sheet","")) + "|" + str(md.get("row","")) + "|" + (d.text or "")).encode()).hexdigest()[:32]
+            row_nodes.append(TextNode(text=d.text, metadata=md, id_=node_id))
+        else:
+            other_docs.append(d)
+
+    # Parse non‑row docs to nodes
+    other_nodes: list[TextNode] = []
+    if other_docs:
+        other_nodes = Settings.node_parser.get_nodes_from_documents(other_docs)
+
+    all_nodes = row_nodes + other_nodes
+    idx = VectorStoreIndex(nodes=all_nodes)
     try:
         os.makedirs(cache_dir, exist_ok=True)
         idx.storage_context.persist(persist_dir=cache_dir)
@@ -228,44 +322,48 @@ def build_or_load_index_persisted(
 # ---------------------------
 
 def retrieve_answer(indexed: IndexedCorpus, question: str, k: int) -> tuple[str, list[dict]]:
+    """Return (answer_text, sources) where sources carry doc, page OR sheet/row and a snippet."""
+    def _pack_src(meta: dict, content: str) -> dict:
+        return {
+            "source": meta.get("source", meta.get("file_name", "unknown")),
+            "page": meta.get("page"),
+            "sheet": meta.get("sheet"),
+            "row": meta.get("row"),
+            "snippet": content[:500],
+            "headers": meta.get("headers"),
+        }
+
     if indexed.index is None:
         # naive skim over raw docs
         toks = [t for t in re.split(r"\W+", (question or "").lower()) if t]
-        scores: list[tuple[int, dict]] = []
+        scored: list[tuple[int, dict]] = []
         for d in indexed.raw_docs:
             txt = (d.text or "").lower()
             score = sum(txt.count(tok) for tok in toks)
-            scores.append((score, {"text": d.text, "metadata": d.metadata}))
-        scores.sort(key=lambda x: x[0], reverse=True)
-        top = scores[:k]
-        srcs = []
+            scored.append((score, {"text": d.text, "metadata": d.metadata}))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = []
         seen = set()
-        for _, d in top:
+        for _, d in scored[:k]:
             meta = d.get("metadata", {}) or {}
-            src = meta.get("source", "unknown")
-            pg  = meta.get("page")
-            snip = (d.get("text", "") or "")[:500]
-            key = (src, pg, snip[:100])
+            key = (meta.get("source"), meta.get("page"), meta.get("sheet"), meta.get("row"))
             if key in seen: continue
             seen.add(key)
-            srcs.append({"source": src, "page": pg, "snippet": snip})
-        return "", srcs
+            out.append(_pack_src(meta, d.get("text", "") or ""))
+        return "", out
 
     try:
         qe = indexed.index.as_query_engine(similarity_top_k=k)
         resp = qe.query(question)
-        srcs = []
+        out = []
         seen = set()
         for n in getattr(resp, "source_nodes", [])[:k]:
             meta = n.node.metadata or {}
-            src = meta.get("source", meta.get("file_name", "unknown"))
-            pg  = meta.get("page")
-            snip = n.node.get_content()[:500]
-            key = (src, pg, snip[:100])
+            key = (meta.get("source"), meta.get("page"), meta.get("sheet"), meta.get("row"))
             if key in seen: continue
             seen.add(key)
-            srcs.append({"source": src, "page": pg, "snippet": snip})
-        return getattr(resp, "response", str(resp)), srcs
+            out.append(_pack_src(meta, n.node.get_content()))
+        return getattr(resp, "response", str(resp)), out
     except Exception as e:
         return f"[query error] {e}", []
 
@@ -329,7 +427,7 @@ def gather_evidence(indexed: IndexedCorpus, claims: list[str], k_per: int) -> li
     # de‑dup
     seen = set(); out = []
     for c in cites:
-        key = (c["source"], c.get("page"), (c.get("snippet", "")[:120]))
+        key = (c["source"], c.get("page"), c.get("sheet"), c.get("row"), (c.get("snippet", "")[:120]))
         if key in seen: continue
         seen.add(key); out.append(c)
     return out[:12]
@@ -356,6 +454,40 @@ def llm_judge(policy_answer: str, vendor_answer: str) -> tuple[bool, str]:
         return False, f"[judge error] {e}"
 
 # ---------------------------
+# Helpers: label/heading extraction for policy mapping rows
+# ---------------------------
+
+def _extract_policy_label_from_snippet(snippet: str) -> str | None:
+    if not snippet:
+        return None
+    # Look for lines like "Control Name: X", "Policy: Y", "Requirement: Z", etc.
+    candidates = [
+        r"^control\s*name\s*:\s*(.+)$",
+        r"^control\s*id\s*:\s*(.+)$",
+        r"^policy\s*name\s*:\s*(.+)$",
+        r"^policy\s*:\s*(.+)$",
+        r"^requirement\s*:\s*(.+)$",
+        r"^title\s*:\s*(.+)$",
+        r"^name\s*:\s*(.+)$",
+        r"^id\s*:\s*(.+)$",
+    ]
+    lines = [l.strip() for l in snippet.splitlines() if l.strip()]
+    for line in lines[:12]:  # scan first dozen lines
+        for pat in candidates:
+            m = re.match(pat, line, flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                return (val[:120] + "…") if len(val) > 120 else val
+    # fallback: first short-ish line
+    for line in lines:
+        if 3 <= len(line) <= 80:
+            return line
+    # ultimate fallback: first 10 words of snippet
+    words = re.split(r"\s+", snippet)
+    return " ".join(words[:10]) + ("…" if len(words) > 10 else "")
+
+
+# ---------------------------
 # Session state containers
 # ---------------------------
 if "policy_index" not in st.session_state:
@@ -364,14 +496,19 @@ if "q_items" not in st.session_state:
     st.session_state.q_items = []  # [{id,text,answer}]
 
 # ---------------------------
-# Upload global policy docs (built ahead of questions)
+# Upload global policy docs (built ahead of questions) — ACCEPTS Excel/CSV
 # ---------------------------
+
 st.subheader("1) Upload Company Policy Documents (global)")
-pol_files = st.file_uploader("Upload .pdf / .docx / .txt / .md", type=["pdf","docx","txt","md"], accept_multiple_files=True)
+pol_files = st.file_uploader(
+    "Upload .pdf / .docx / .txt / .md / .xlsx / .xls / .csv",
+    type=["pdf","docx","txt","md","xlsx","xls","csv"],
+    accept_multiple_files=True
+)
 policy_docs = files_to_docs(pol_files, "policy") if pol_files else []
 
 if policy_docs:
-    st.success(f"Loaded {len(policy_docs)} policy doc parts (pages or files).")
+    st.success(f"Loaded {len(policy_docs)} policy doc parts (pages/rows/files).")
     if auto_build:
         with st.spinner("Building/Loading policy index…"):
             st.session_state.policy_index = build_or_load_index_persisted(policy_docs, prefix="policy", persist_root=PERSIST_ROOT)
@@ -391,6 +528,7 @@ st.divider()
 # ---------------------------
 # 2) Questions: prewritten + dynamic rows (answer + evidence per question)
 # ---------------------------
+
 st.subheader("2) Vendor Questions, Answers, & Evidence (per question)")
 
 PREWRITTEN = [
@@ -425,7 +563,7 @@ for i, item in enumerate(st.session_state.q_items, start=1):
             ans = st.text_area("Vendor Answer", value=item.get("answer",""), height=120, key=f"ans_{qid}", placeholder="Vendor's plain‑English answer…")
             st.session_state.q_items[i-1]["answer"] = ans
         with c2:
-            ev_files = st.file_uploader("Evidence docs", type=["pdf","docx","txt","md"], accept_multiple_files=True, key=f"ev_{qid}")
+            ev_files = st.file_uploader("Evidence docs", type=["pdf","docx","txt","md","xlsx","xls","csv"], accept_multiple_files=True, key=f"ev_{qid}")
             ev_docs = files_to_docs(ev_files, "third") if ev_files else []
             if ev_docs:
                 per_question_vendor_indexes[qid] = build_or_load_index_persisted(ev_docs, prefix=f"third-{qid}", persist_root=PERSIST_ROOT)
@@ -453,7 +591,20 @@ if run:
 
             # 1) Map question → policy (best passages)
             pol_answer, pol_sources = retrieve_answer(policy_corpus, q, k=k_policy)
-            best_policy_doc = pol_sources[0]["source"] if pol_sources else "(none)"
+            # Build a human-friendly mapping label: <Control/Policy> — <Doc> (loc)
+            if pol_sources:
+                src0 = pol_sources[0]
+                control = _extract_policy_label_from_snippet(src0.get("snippet", "")) or "(unlabeled)"
+                src_name = src0.get("source", "(unknown)")
+                if src0.get("page"):
+                    loc = f"p.{src0['page']}"
+                elif src0.get("sheet") and src0.get("row"):
+                    loc = f"{src0['sheet']} r.{src0['row']}"
+                else:
+                    loc = "(location n/a)"
+                mapping_label = f"{control} — {src_name} ({loc})"
+            else:
+                mapping_label = "(no policy match)"
 
             # 2) Judge vendor answer vs policy
             meets, rationale = llm_judge(pol_answer, a)
@@ -472,9 +623,13 @@ if run:
                 suggestion = "⚠️ Insufficient evidence"
 
             def fmt_source(s: dict) -> str:
-                pg = f" p.{s['page']}" if s.get('page') else ""
+                where = (
+                    f" p.{s['page']}" if s.get('page') else (
+                        f" {s['sheet']} r.{s['row']}" if s.get('sheet') and s.get('row') else ""
+                    )
+                )
                 sn = (s.get('snippet','') or '')
-                return f"• {s['source']}{pg}: {sn[:260]}…"
+                return f"• {s['source']}{where}: {sn[:260]}…"
 
             ev_display = "\n\n".join(fmt_source(s) for s in ev_cites[:6]) or "(no evidence)"
 
@@ -482,12 +637,12 @@ if run:
                 "#": idx,
                 "Question": q,
                 "Vendor Answer": a[:900] if a else "(none)",
-                "Internal Policy (best match)": best_policy_doc,
+                "Internal Policy (best match)": mapping_label,
                 "Policy Answer": pol_answer[:800],
                 "Evidence (from vendor docs)": ev_display,
                 "Suggestion": suggestion,
                 "Rationale": (rationale or "").strip()[:900],
-                "Evidence docs count": len(ev_cites),
+                "Evidence cites": len(ev_cites),
             })
 
     st.success("Validation complete.")
@@ -507,4 +662,4 @@ if run:
     json_bytes = json.dumps(results_rows, indent=2).encode("utf-8")
     st.download_button("Download Results (JSON)", json_bytes, "vendor_policy_validation.json", "application/json", use_container_width=True)
 
-st.caption("For each question: we map to the best matching internal policy, judge the vendor's plain‑English answer against policy, mine supporting evidence from the vendor's uploaded docs, and recommend Acceptable / Not acceptable / Insufficient.")
+st.caption("For each question: we map to the best matching internal policy (with doc + page or sheet/row), judge the vendor's plain‑English answer against policy, mine supporting evidence from the vendor's uploaded docs, and recommend Acceptable / Not acceptable / Insufficient.")
