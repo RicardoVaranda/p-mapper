@@ -33,6 +33,7 @@ import re
 import json
 import uuid
 import hashlib
+import shutil
 import typing as t
 from dataclasses import dataclass
 
@@ -117,7 +118,7 @@ def files_to_docs(files: list, kind: str) -> list[dict]:
 # ------------------------- LlamaIndex plumbing -------------------------------
 LLM_AVAILABLE = True
 try:
-    from llama_index.core import Document, VectorStoreIndex, Settings
+    from llama_index.core import Document, VectorStoreIndex, Settings, StorageContext, load_index_from_storage
     from llama_index.llms.openai import OpenAI
     from llama_index.embeddings.openai import OpenAIEmbedding
 except Exception:
@@ -194,6 +195,56 @@ def _docs_cache_key(docs: list[dict]) -> str:
         h.update(src.encode("utf-8"))
         h.update((d.get("text", "")[:5000]).encode("utf-8", errors="ignore"))
     return h.hexdigest()
+
+# -------- Persistent index cache helpers (disk) ------------------------------
+
+def _docs_fingerprint_full(docs: list[dict]) -> str:
+    """Stable fingerprint over full texts + sources (order-sensitive)."""
+    h = hashlib.sha1()
+    for d in docs:
+        src = d.get("metadata", {}).get("source", "")
+        h.update((src + "").encode("utf-8", errors="ignore"))
+        h.update(((d.get("text", "") or "") + "").encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def build_or_load_index_persisted(
+    docs: list[dict],
+    api_key: str | None,
+    model_name: str | None,
+    base_url: str = "",
+    embed_model: str | None = None,
+    persist_root: str = ".llama_cache",
+    prefix: str = "idx",
+) -> IndexedCorpus:
+    """Load VectorStoreIndex from disk if present; otherwise build and persist.
+    Falls back to in-memory build when LLM modules are unavailable.
+    """
+    if not (LLM_AVAILABLE and api_key and model_name and StorageContext and load_index_from_storage):
+        return build_index(docs, api_key, model_name, base_url, embed_model)
+
+    key = f"{prefix}-{_docs_fingerprint_full(docs)}-{(embed_model or 'default')}"
+    cache_dir = os.path.join(persist_root, key)
+    try:
+        # Try load
+        if os.path.isdir(cache_dir) and os.listdir(cache_dir):
+            storage_context = StorageContext.from_defaults(persist_dir=cache_dir)
+            idx = load_index_from_storage(storage_context)
+            # Recreate raw_docs for traceability
+            li_docs = [Document(text=d.get("text", ""), metadata=d.get("metadata", {})) for d in docs]
+            return IndexedCorpus(index=idx, raw_docs=li_docs)
+    except Exception:
+        pass
+
+    # Build fresh and persist
+    corpus = build_index(docs, api_key, model_name, base_url, embed_model)
+    try:
+        if corpus.index is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            corpus.index.storage_context.persist(persist_dir=cache_dir)
+    except Exception:
+        pass
+    return corpus
 
 
 def retrieve_answer(indexed: IndexedCorpus, question: str, k: int = 3) -> tuple[str, list[dict]]:
@@ -272,6 +323,23 @@ with st.sidebar:
     embed_model = st.text_input("Embedding model (optional)", value="")
     st.caption("Leave key blank to run without LLM indexing; results may be limited.")
 
+    st.markdown("---")
+    persist_enabled = st.checkbox("Persist indexes to disk (cache)", value=True,
+                                  help="Caches vector stores (incl. embeddings) on disk for reuse across runs/sessions.")
+    cache_root = st.text_input("Cache directory", value=".llama_cache")
+    colc1, colc2 = st.columns(2)
+    with colc1:
+        if st.button("Clear index cache", use_container_width=True):
+            try:
+                shutil.rmtree(cache_root)
+                st.success("Cleared cache directory.")
+            except FileNotFoundError:
+                st.info("Cache already empty.")
+            except Exception as e:
+                st.warning(f"Couldn't clear cache: {e}")
+    with colc2:
+        st.caption("Cache key = fingerprint(docs) + embedding model")
+
 # 1) Global Company Policy upload
 st.subheader("1) Upload Company Policy Documents (global)")
 policy_files = st.file_uploader(
@@ -293,11 +361,11 @@ if "q_items" not in st.session_state:
 cols = st.columns([1,1,1,4])
 if cols[0].button("➕ Add question", use_container_width=True):
     st.session_state.q_items.append({"id": str(uuid.uuid4())[:8], "text": ""})
-    st.rerun()
+    st.experimental_rerun()
 
 if cols[1].button("➖ Remove last", use_container_width=True) and len(st.session_state.q_items) > 1:
     st.session_state.q_items.pop()
-    st.rerun()
+    st.experimental_rerun()
 
 # Render each question block
 for idx, item in enumerate(st.session_state.q_items, start=1):
@@ -326,7 +394,9 @@ if run_btn:
     with st.spinner("Building indices and analyzing…"):
         # Build global policy index (cached)
         policy_key = "pol:" + _docs_cache_key(policy_parsed)
-        policy_index = build_index_cached(policy_key, policy_parsed, api_key=api_key, model_name=model_name, base_url=base_url, embed_model=embed_model or None)
+        policy_index = build_or_load_index_persisted(policy_parsed, api_key=api_key, model_name=model_name, base_url=base_url,
+                                                     embed_model=embed_model or None, persist_root=cache_root, prefix="policy") if persist_enabled \
+                 else build_index_cached(policy_key, policy_parsed, api_key=api_key, model_name=model_name, base_url=base_url, embed_model=embed_model or None)
 
         for idx, item in enumerate(st.session_state.q_items, start=1):
             q = (item.get("text") or "").strip()
@@ -337,7 +407,9 @@ if run_btn:
             third_files = st.session_state.get(f"third_up_{item['id']}") or []
             third_docs = files_to_docs(third_files, "third")
             third_key = f"thr:{item['id']}:{_docs_cache_key(third_docs)}"
-            third_index = build_index_cached(third_key, third_docs, api_key=api_key, model_name=model_name, base_url=base_url, embed_model=embed_model or None)
+            third_index = build_or_load_index_persisted(third_docs, api_key=api_key, model_name=model_name, base_url=base_url,
+                                                    embed_model=embed_model or None, persist_root=cache_root, prefix=f"third-{item['id']}") if persist_enabled \
+                 else build_index_cached(third_key, third_docs, api_key=api_key, model_name=model_name, base_url=base_url, embed_model=embed_model or None)
 
             # Retrieve
             pol_answer, pol_sources = retrieve_answer(policy_index, q, k=3)
