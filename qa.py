@@ -4,9 +4,10 @@
 # Ask regulator questions → evidence-backed drafts + citations
 # Excel/CSV: ONE ROW = ONE NODE/EMBEDDING. PDFs/DOCX/TXT: chunked.
 # JSON-safe embed cache. Persistent indexes & files. Visual PDF & row previews.
+# Hybrid retrieval: dense + BM25 + fuzzy (general, domain-agnostic).
 # Confidence scoring: multi-signal (similarity, coverage, diversity, alignment via rapidfuzz, corpus weight),
 # blended with judge confidence.
-# Retrieval: GENERAL HYBRID (dense + BM25 keyword + fuzzy), no domain-specific lexicons.
+# Includes: cache rebuild on persisted index load + node/chunk inspector.
 
 import os
 import io
@@ -274,6 +275,49 @@ def render_pdf_page_with_highlight(file_bytes: bytes, page_num: int, query_text:
         return None
 
 # ---------------------------
+# Tokenization / BM25 / fuzzy helpers (general-purpose)
+# ---------------------------
+STOPWORDS = {
+    "the","a","an","and","or","of","to","in","for","on","at","by","with",
+    "is","are","was","were","be","been","being","as","that","this","these",
+    "those","from","it","its","we","you","your","our","they","their","them",
+    "about","into","over","under","per","via","within","without","not","no",
+    "but","if","then","than","so","such","any","all","each","every"
+}
+_word_re = re.compile(r"\b\w+\b", re.UNICODE)
+
+def tokenize(text: str) -> List[str]:
+    return [t for t in (_word_re.findall(text.lower()) if text else []) if t not in STOPWORDS]
+
+def bm25_score_row(query_tokens: List[str], tf: Counter, dl: int, df_map: Dict[str,int], N: int, avgdl: float, k1: float = 1.5, b: float = 0.75) -> float:
+    if not query_tokens or not tf or dl <= 0 or N <= 0 or avgdl <= 0:
+        return 0.0
+    score = 0.0
+    for term in query_tokens:
+        df = df_map.get(term, 0)
+        if df == 0:
+            continue
+        idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+        f = tf.get(term, 0)
+        if f <= 0:
+            continue
+        denom = f + k1 * (1 - b + b * (dl / avgdl))
+        score += idf * (f * (k1 + 1) / denom)
+    # squash to ~[0,1]
+    return 1 - math.exp(-score / 5.0)
+
+def fuzzy_partial(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return max(0.0, min(1.0, fuzz.partial_ratio(a, b) / 100.0))
+
+def norm_sim_dense(s: float) -> float:
+    try:
+        return max(0.0, min(1.0, (float(s) - 0.4) / (0.85 - 0.4)))
+    except Exception:
+        return 0.0
+
+# ---------------------------
 # Session state
 # ---------------------------
 def ensure_state_defaults():
@@ -350,28 +394,6 @@ def _init_embed_cache(path: str):
         conn.close()
 
 _init_embed_cache(st.session_state.embed_cache_path)
-
-# ---------------------------
-# Load persisted indexes (if any) on startup/refresh
-# ---------------------------
-def try_load_persisted_indexes():
-    if os.path.isdir(POLICY_DIR) and not st.session_state.get("policy_index"):
-        try:
-            sc = StorageContext.from_defaults(persist_dir=POLICY_DIR)
-            st.session_state.policy_index = load_index_from_storage(sc)
-        except Exception as e:
-            st.warning(f"Could not load persisted policy index: {e}")
-
-    if os.path.isdir(EMAIL_DIR) and not st.session_state.get("email_index"):
-        try:
-            sc = StorageContext.from_defaults(persist_dir=EMAIL_DIR)
-            st.session_state.email_index = load_index_from_storage(sc)
-        except Exception as e:
-            st.warning(f"Could not load persisted prior responses index: {e}")
-
-    st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
-
-try_load_persisted_indexes()
 
 # ---------------------------
 # Uploaders
@@ -579,49 +601,6 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ---------------------------
-# Tokenization / BM25 / fuzzy helpers (general-purpose)
-# ---------------------------
-STOPWORDS = {
-    "the","a","an","and","or","of","to","in","for","on","at","by","with",
-    "is","are","was","were","be","been","being","as","that","this","these",
-    "those","from","it","its","we","you","your","our","they","their","them",
-    "about","into","over","under","per","via","within","without","not","no",
-    "but","if","then","than","so","such","any","all","each","every"
-}
-_word_re = re.compile(r"\b\w+\b", re.UNICODE)
-
-def tokenize(text: str) -> List[str]:
-    return [t for t in (_word_re.findall(text.lower()) if text else []) if t not in STOPWORDS]
-
-def bm25_score_row(query_tokens: List[str], tf: Counter, dl: int, df_map: Dict[str,int], N: int, avgdl: float, k1: float = 1.5, b: float = 0.75) -> float:
-    if not query_tokens or not tf or dl <= 0 or N <= 0 or avgdl <= 0:
-        return 0.0
-    score = 0.0
-    for term in query_tokens:
-        df = df_map.get(term, 0)
-        if df == 0:
-            continue
-        idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
-        f = tf.get(term, 0)
-        if f <= 0:
-            continue
-        denom = f + k1 * (1 - b + b * (dl / avgdl))
-        score += idf * (f * (k1 + 1) / denom)
-    # squash to ~[0,1]
-    return 1 - math.exp(-score / 5.0)
-
-def fuzzy_partial(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    return max(0.0, min(1.0, fuzz.partial_ratio(a, b) / 100.0))
-
-def norm_sim_dense(s: float) -> float:
-    try:
-        return max(0.0, min(1.0, (float(s) - 0.4) / (0.85 - 0.4)))
-    except Exception:
-        return 0.0
-
-# ---------------------------
 # Build indexes — cached embeddings, docstore-first, persist
 # - Excel/CSV: ONE ROW = ONE NODE (no splitting)
 # - Other docs: chunk via SentenceSplitter
@@ -826,35 +805,89 @@ def build_index_incremental_preembedded_cached(
     return index
 
 # ---------------------------
-# Helper: ensure indexes exist (lazy build); consider persisted storage
+# Rebuild row caches/BM25 from persisted indexes
 # ---------------------------
-def ensure_indexes_built() -> bool:
-    try_load_persisted_indexes()
-    need_policy = st.session_state.policy_index is None and bool(st.session_state.policy_docs)
-    need_email  = st.session_state.email_index  is None and bool(st.session_state.email_docs)
+def rebuild_row_caches_from_index(index, corpus: str):
+    """
+    Rebuild row caches (node_id -> text/meta/tf/dl) and BM25 stats (df, N, avgdl)
+    by scanning the docstore of a loaded/persisted index.
+    """
+    if not index:
+        return
 
-    if need_policy or need_email:
-        with st.spinner("Building indexes on demand…"):
-            configure_settings()
-            if need_policy:
-                st.session_state.policy_index = build_index_incremental_preembedded_cached(
-                    st.session_state.policy_docs,
-                    label="Policy corpus",
-                    page_batch_size=embed_page_batch,
-                    api_batch_size=embed_api_batch,
-                    max_tokens_unused=0,  # ignored
-                )
-            if need_email:
-                st.session_state.email_index = build_index_incremental_preembedded_cached(
-                    st.session_state.email_docs,
-                    label="Prior responses corpus",
-                    page_batch_size=embed_page_batch,
-                    api_batch_size=embed_api_batch,
-                    max_tokens_unused=0,  # ignored
-                )
+    ds = getattr(index, "_docstore", None) or index.storage_context.docstore
+    try:
+        ids = ds.get_all_document_ids()
+    except Exception:
+        ids = list(getattr(ds, "docs", {}).keys())
+
+    # Reset targets
+    if corpus == "policy":
+        st.session_state.policy_row_cache = {}
+        bm_df_local = defaultdict(int); bm_N_local = 0; bm_sumdl_local = 0
+    else:
+        st.session_state.email_row_cache = {}
+        bm_df_local = defaultdict(int); bm_N_local = 0; bm_sumdl_local = 0
+
+    for nid in ids:
+        node = ds.get_document(nid, raise_error=False)
+        if node is None:
+            continue
+        md = node.metadata or {}
+        if not md.get("row_node", False):
+            continue
+        try:
+            txt = node.get_text()
+        except Exception:
+            txt = getattr(node, "text", "") or ""
+
+        toks = tokenize(txt)
+        tf = Counter(toks)
+        dl = max(1, len(toks))
+
+        if corpus == "policy":
+            st.session_state.policy_row_cache[nid] = {"text": (txt or "").lower(), "meta": md, "tf": tf, "dl": dl}
+        else:
+            st.session_state.email_row_cache[nid] = {"text": (txt or "").lower(), "meta": md, "tf": tf, "dl": dl}
+
+        for term in tf.keys():
+            bm_df_local[term] += 1
+        bm_N_local += 1
+        bm_sumdl_local += dl
+
+    stats = {
+        "df": dict(bm_df_local),
+        "N": bm_N_local,
+        "avgdl": (bm_sumdl_local / bm_N_local) if bm_N_local > 0 else 0.0,
+    }
+    if corpus == "policy":
+        st.session_state.policy_bm25 = stats
+    else:
+        st.session_state.email_bm25 = stats
+
+# ---------------------------
+# Load persisted indexes (and rebuild caches) on startup/refresh
+# ---------------------------
+def try_load_persisted_indexes():
+    if os.path.isdir(POLICY_DIR) and not st.session_state.get("policy_index"):
+        try:
+            sc = StorageContext.from_defaults(persist_dir=POLICY_DIR)
+            st.session_state.policy_index = load_index_from_storage(sc)
+            rebuild_row_caches_from_index(st.session_state.policy_index, "policy")  # NEW
+        except Exception as e:
+            st.warning(f"Could not load persisted policy index: {e}")
+
+    if os.path.isdir(EMAIL_DIR) and not st.session_state.get("email_index"):
+        try:
+            sc = StorageContext.from_defaults(persist_dir=EMAIL_DIR)
+            st.session_state.email_index = load_index_from_storage(sc)
+            rebuild_row_caches_from_index(st.session_state.email_index, "email")  # NEW
+        except Exception as e:
+            st.warning(f"Could not load persisted prior responses index: {e}")
 
     st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
-    return st.session_state.vector_ready
+
+try_load_persisted_indexes()
 
 # ---------------------------
 # Build / Rebuild Indexes button
@@ -1263,6 +1296,38 @@ def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str
     return "\n".join(evidence_lines), tag_to_file, tag_to_score, tag_to_page
 
 # ---------------------------
+# Ensure indexes (lazy load/build), now that rebuild is defined
+# ---------------------------
+def ensure_indexes_built() -> bool:
+    # reload persisted if available (also rebuilds caches)
+    try_load_persisted_indexes()
+    need_policy = st.session_state.policy_index is None and bool(st.session_state.policy_docs)
+    need_email  = st.session_state.email_index  is None and bool(st.session_state.email_docs)
+
+    if need_policy or need_email:
+        with st.spinner("Building indexes on demand…"):
+            configure_settings()
+            if need_policy:
+                st.session_state.policy_index = build_index_incremental_preembedded_cached(
+                    st.session_state.policy_docs,
+                    label="Policy corpus",
+                    page_batch_size=embed_page_batch,
+                    api_batch_size=embed_api_batch,
+                    max_tokens_unused=0,  # ignored
+                )
+            if need_email:
+                st.session_state.email_index = build_index_incremental_preembedded_cached(
+                    st.session_state.email_docs,
+                    label="Prior responses corpus",
+                    page_batch_size=embed_page_batch,
+                    api_batch_size=embed_api_batch,
+                    max_tokens_unused=0,  # ignored
+                )
+
+    st.session_state.vector_ready = bool(st.session_state.policy_index or st.session_state.email_index)
+    return st.session_state.vector_ready
+
+# ---------------------------
 # Questions UI
 # ---------------------------
 st.markdown("### Ask Regulator Questions")
@@ -1281,6 +1346,79 @@ q_table = st.data_editor(
     key="q_editor",
     column_config={"question": st.column_config.TextColumn("Question", required=False, width="large")},
 )
+
+# ---------------------------
+# 🔍 Inspect index contents (nodes/chunks)
+# ---------------------------
+with st.expander("🔍 Inspect index contents (nodes/chunks)", expanded=False):
+    corpus_choice = st.selectbox("Corpus", ["Policy", "Prior Responses"])
+    index = st.session_state.policy_index if corpus_choice == "Policy" else st.session_state.email_index
+
+    if not index:
+        st.info("No index loaded for this corpus yet.")
+    else:
+        ds = getattr(index, "_docstore", None) or index.storage_context.docstore
+        try:
+            ids = ds.get_all_document_ids()
+        except Exception:
+            ids = list(getattr(ds, "docs", {}).keys())
+
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            kw = st.text_input("Filter by keyword (substring)")
+        with col2:
+            src_filter = st.text_input("Filter by source filename contains")
+        with col3:
+            sheet_filter = st.text_input("Filter by sheet name contains (Excel only)")
+
+        show_rows_only = st.checkbox("Show ONLY Excel/CSV row nodes", value=False)
+        max_show = st.slider("Show up to N entries", 50, 2000, 500, 50)
+
+        rows = []
+        total_rows = 0
+        for nid in ids:
+            node = ds.get_document(nid, raise_error=False)
+            if node is None:
+                continue
+            md = node.metadata or {}
+            try:
+                text = node.get_text()
+            except Exception:
+                text = getattr(node, "text", "") or ""
+            src = md.get("source", "")
+            page = md.get("page")
+            sheet = md.get("sheet")
+            rowno = md.get("row")
+            is_row = md.get("row_node", False)
+
+            if show_rows_only and not is_row:
+                continue
+            if src_filter and (src_filter.lower() not in str(src).lower()):
+                continue
+            if sheet_filter and (sheet is None or sheet_filter.lower() not in str(sheet).lower()):
+                continue
+            if kw and (kw.lower() not in text.lower()):
+                continue
+
+            total_rows += 1
+            if len(rows) < max_show:
+                rows.append({
+                    "node_id": nid,
+                    "source": src,
+                    "page": page,
+                    "sheet": sheet,
+                    "row": rowno,
+                    "row_node": is_row,
+                    "chars": len(text),
+                    "preview": re.sub(r"\s+", " ", text)[:300]
+                })
+
+        st.write(f"Showing {len(rows)} / {total_rows} matching nodes.")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("No nodes matched your filters.")
 
 # ---------------------------
 # Generate Responses (lazy-build if needed)
