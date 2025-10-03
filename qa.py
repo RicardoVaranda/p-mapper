@@ -2,29 +2,26 @@
 # -------------------------------------------------------------------------
 # Upload Policy docs & Prior Regulator Responses (PDF/DOCX/TXT/XLSX/CSV)
 # Ask regulator questions → evidence-backed drafts + citations
-# Excel/CSV: ONE ROW = ONE NODE/EMBEDDING. PDFs/DOCX/TXT: chunked.
+# Chunking-only for PDFs/DOCX/TXT; Excel/CSV: ONE ROW = ONE NODE/EMBEDDING.
 # JSON-safe embed cache. Persistent indexes & files. Visual PDF & row previews.
 # Confidence scoring: multi-signal (similarity, coverage, diversity, alignment via rapidfuzz, corpus weight),
 # blended with judge confidence.
-# Retrieval: GENERAL HYBRID (dense + BM25 keyword + fuzzy), no domain-specific lexicons.
 
 import os
 import io
 import re
 import json
 import time
-import math
 import sqlite3
 import hashlib
 from html import escape
 from typing import List, Tuple, Dict, Optional
-from collections import Counter, defaultdict
 
 import streamlit as st
 import pandas as pd
 import docx2txt
 from PyPDF2 import PdfReader
-from rapidfuzz import fuzz  # for alignment + fuzzy
+from rapidfuzz import fuzz  # for alignment scoring
 
 # Optional preview backends (visual PDF previews)
 try:
@@ -161,32 +158,17 @@ def read_txt(file_bytes: bytes) -> str:
 def read_excel_rows(file_bytes: bytes) -> List[Tuple[str, int, Dict[str, str]]]:
     """
     Return list of (sheet_name, row_index_1based, ordered_row_dict).
-    Reads ALL sheets at once; preserves column order; trims whitespace;
-    includes a row if ANY cell is non-empty after trimming.
+    Keeps original column order; includes only non-empty cells.
     """
     out: List[Tuple[str, int, Dict[str, str]]] = []
     bio = io.BytesIO(file_bytes)
-    all_sheets = pd.read_excel(
-        bio,
-        sheet_name=None,
-        dtype=str,
-        engine=None,
-        keep_default_na=False
-    )
-    for sheet_name, df in (all_sheets or {}).items():
-        if df is None or df.empty:
+    xls = pd.ExcelFile(bio)
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+        if df.empty:
             continue
         df = df.fillna("")
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
         cols = [str(c) for c in df.columns]
-        mask_non_empty = df.apply(
-            lambda r: any((isinstance(v, str) and v.strip() != "") or (not isinstance(v, str) and str(v).strip() != "")
-                          for v in r.values),
-            axis=1
-        )
-        if not mask_non_empty.any():
-            continue
-        df = df.loc[mask_non_empty]
         for ridx, row in df.iterrows():
             row_dict: Dict[str, str] = {}
             for c in cols:
@@ -195,7 +177,7 @@ def read_excel_rows(file_bytes: bytes) -> List[Tuple[str, int, Dict[str, str]]]:
                     row_dict[c] = v
             if not row_dict:
                 continue
-            out.append((str(sheet_name), int(ridx) + 1, row_dict))
+            out.append((sheet, int(ridx) + 1, row_dict))
     return out
 
 def read_csv_rows(file_bytes: bytes) -> List[Tuple[str, int, Dict[str, str]]]:
@@ -320,18 +302,6 @@ def ensure_state_defaults():
         except Exception:
             pass
 
-    # Row caches (node_id -> dict{text, meta, tf, dl})
-    if "policy_row_cache" not in st.session_state:
-        st.session_state.policy_row_cache = {}
-    if "email_row_cache" not in st.session_state:
-        st.session_state.email_row_cache = {}
-
-    # BM25 corpus stats per row-corpus
-    if "policy_bm25" not in st.session_state:
-        st.session_state.policy_bm25 = {"df": {}, "N": 0, "avgdl": 0.0}
-    if "email_bm25" not in st.session_state:
-        st.session_state.email_bm25 = {"df": {}, "N": 0, "avgdl": 0.0}
-
 ensure_state_defaults()
 
 def _init_embed_cache(path: str):
@@ -451,14 +421,6 @@ def add_to_docs(files, target_list, corpus_name: str):
             if not rows:
                 st.warning(f"No usable rows found in {name}")
                 continue
-            # DEBUG summary per-sheet
-            sheet_counts = {}
-            for sheet, rownum, row_dict in rows:
-                sheet_counts.setdefault(sheet, 0)
-                sheet_counts[sheet] += 1
-            with st.expander(f"📊 Ingestion summary for {name}", expanded=False):
-                st.json({"corpus": corpus_name, "total_rows_to_ingest": sum(sheet_counts.values()), "per_sheet": sheet_counts})
-
             for sheet, rownum, row_dict in rows:
                 doc_text = row_dict_to_text(row_dict)
                 row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
@@ -479,11 +441,6 @@ def add_to_docs(files, target_list, corpus_name: str):
             if not rows:
                 st.warning(f"No usable rows found in {name}")
                 continue
-
-            # DEBUG summary for CSV
-            with st.expander(f"📊 Ingestion summary for {name}", expanded=False):
-                st.json({"corpus": corpus_name, "total_rows_to_ingest": len(rows), "per_sheet": {"CSV": len(rows)}})
-
             for sheet, rownum, row_dict in rows:
                 doc_text = row_dict_to_text(row_dict)
                 row_key = hashlib.sha1(("||".join(f"{k}={v}" for k, v in row_dict.items())).encode()).hexdigest()[:12]
@@ -579,53 +536,9 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ---------------------------
-# Tokenization / BM25 / fuzzy helpers (general-purpose)
-# ---------------------------
-STOPWORDS = {
-    "the","a","an","and","or","of","to","in","for","on","at","by","with",
-    "is","are","was","were","be","been","being","as","that","this","these",
-    "those","from","it","its","we","you","your","our","they","their","them",
-    "about","into","over","under","per","via","within","without","not","no",
-    "but","if","then","than","so","such","any","all","each","every"
-}
-_word_re = re.compile(r"\b\w+\b", re.UNICODE)
-
-def tokenize(text: str) -> List[str]:
-    return [t for t in (_word_re.findall(text.lower()) if text else []) if t not in STOPWORDS]
-
-def bm25_score_row(query_tokens: List[str], tf: Counter, dl: int, df_map: Dict[str,int], N: int, avgdl: float, k1: float = 1.5, b: float = 0.75) -> float:
-    if not query_tokens or not tf or dl <= 0 or N <= 0 or avgdl <= 0:
-        return 0.0
-    score = 0.0
-    for term in query_tokens:
-        df = df_map.get(term, 0)
-        if df == 0:
-            continue
-        idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
-        f = tf.get(term, 0)
-        if f <= 0:
-            continue
-        denom = f + k1 * (1 - b + b * (dl / avgdl))
-        score += idf * (f * (k1 + 1) / denom)
-    # squash to ~[0,1]
-    return 1 - math.exp(-score / 5.0)
-
-def fuzzy_partial(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    return max(0.0, min(1.0, fuzz.partial_ratio(a, b) / 100.0))
-
-def norm_sim_dense(s: float) -> float:
-    try:
-        return max(0.0, min(1.0, (float(s) - 0.4) / (0.85 - 0.4)))
-    except Exception:
-        return 0.0
-
-# ---------------------------
 # Build indexes — cached embeddings, docstore-first, persist
 # - Excel/CSV: ONE ROW = ONE NODE (no splitting)
 # - Other docs: chunk via SentenceSplitter
-# - Build BM25 stats for row nodes
 # ---------------------------
 def build_index_incremental_preembedded_cached(
     docs: List[Document],
@@ -641,31 +554,15 @@ def build_index_incremental_preembedded_cached(
       - Embeddings cached in SQLite by hash of normalized text
       - Docstore-first write, then vector store
       - Persist storage to disk (policy/email)
-      - BM25 stats for row nodes (df, N, avgdl)
     """
     # Prepare explicit docstore + vector store
     docstore = SimpleDocumentStore()
     vector_store = SimpleVectorStore()
     storage_context = StorageContext.from_defaults(docstore=docstore, vector_store=vector_store)
-
-    # Decide target cache/stat bucket
-    target_cache = "policy" if "policy" in label.lower() else "email"
-    # Reset caches/stats for this corpus
-    if target_cache == "policy":
-        st.session_state.policy_row_cache = {}
-    else:
-        st.session_state.email_row_cache = {}
-    bm_df_local = defaultdict(int); bm_N_local = 0; bm_sumdl_local = 0
-
     if not docs:
         index = VectorStoreIndex([], storage_context=storage_context)
-        persist_dir = POLICY_DIR if target_cache == "policy" else EMAIL_DIR
+        persist_dir = POLICY_DIR if "policy" in label.lower() else EMAIL_DIR
         index.storage_context.persist(persist_dir=persist_dir)
-        # finalize stats
-        if target_cache == "policy":
-            st.session_state.policy_bm25 = {"df": {}, "N": 0, "avgdl": 0.0}
-        else:
-            st.session_state.email_bm25 = {"df": {}, "N": 0, "avgdl": 0.0}
         return index
 
     def _dummy_text() -> str:
@@ -714,30 +611,13 @@ def build_index_incremental_preembedded_cached(
                 other_docs = [d for d in batch_docs if not (d.metadata or {}).get("row_node")]
 
                 for d in row_docs:
-                    txt = d.text or ""
+                    txt = d.get_text()
                     md = d.metadata or {}
                     node_id = hashlib.sha1(
                         (md.get("source","") + "|" + str(md.get("sheet","")) + "|" + str(md.get("row","")) + "|" + txt).encode("utf-8")
                     ).hexdigest()[:32]
                     n = TextNode(text=txt, metadata=md, id_=node_id)
                     nodes.append(n)
-
-                    # --- Row cache + BM25 stats
-                    toks = tokenize(txt)
-                    tf = Counter(toks)
-                    dl = len(toks)
-                    if target_cache == "policy":
-                        st.session_state.policy_row_cache[node_id] = {
-                            "text": txt.lower(), "meta": md, "tf": tf, "dl": dl
-                        }
-                    else:
-                        st.session_state.email_row_cache[node_id] = {
-                            "text": txt.lower(), "meta": md, "tf": tf, "dl": dl
-                        }
-                    for term in tf.keys():
-                        bm_df_local[term] += 1
-                    bm_N_local += 1
-                    bm_sumdl_local += max(1, dl)
 
                 if other_docs:
                     nodes.extend(parser.get_nodes_from_documents(other_docs))
@@ -808,20 +688,9 @@ def build_index_incremental_preembedded_cached(
             expanded=False
         )
 
-    # Finalize BM25 stats for this corpus
-    stats = {
-        "df": dict(bm_df_local),
-        "N": bm_N_local,
-        "avgdl": (bm_sumdl_local / bm_N_local) if bm_N_local > 0 else 0.0,
-    }
-    if target_cache == "policy":
-        st.session_state.policy_bm25 = stats
-    else:
-        st.session_state.email_bm25 = stats
-
     # Bind index to storage and persist to disk
     index = VectorStoreIndex([], storage_context=storage_context)
-    persist_dir = POLICY_DIR if target_cache == "policy" else EMAIL_DIR
+    persist_dir = POLICY_DIR if "policy" in label.lower() else EMAIL_DIR
     index.storage_context.persist(persist_dir=persist_dir)
     return index
 
@@ -1059,7 +928,7 @@ def compute_confidence(
     return 0.0
 
 # ---------------------------
-# Resilient retrieval plumbing
+# Resilient retrieval with direct-query fallback + auto-repair
 # ---------------------------
 def _repair_index(kind: str) -> Optional[VectorStoreIndex]:
     """Rebuild a single index (policy|email) from loaded docs, using cached embeddings."""
@@ -1130,99 +999,12 @@ def _safe_retrieve_with_fallback(index: Optional[VectorStoreIndex], kind: str, q
         except KeyError:
             return _direct_query_nodes(idx2, q, k)
 
-# ---------------------------
-# GENERAL HYBRID RETRIEVAL (dense + BM25 + fuzzy)
-# ---------------------------
 def retrieve_across(q: str, k: int) -> List[NodeWithScore]:
-    """
-    General hybrid retrieval:
-      1) Dense candidates from both corpora (larger pool)
-      2) Rerank each candidate by combined score:
-         score = 0.60*dense + 0.25*BM25(row-only) + 0.15*fuzzy
-         (BM25 applies when the node is an Excel/CSV row we cached.)
-      3) If still weak, do a row-only sweep via BM25+fuzzy across all row nodes.
-    """
-    q = (q or "").strip()
-    if not q:
-        return []
-    q_tokens = tokenize(q)
-
-    # 1) dense pool
-    pool_k = max(k * 5, 20)
-    cand: List[NodeWithScore] = []
-    cand += _safe_retrieve_with_fallback(st.session_state.policy_index, "policy", q, pool_k)
-    cand += _safe_retrieve_with_fallback(st.session_state.email_index,  "email",  q, pool_k)
-
-    # refs
-    pol_cache = st.session_state.policy_row_cache
-    eml_cache = st.session_state.email_row_cache
-    pol_bm = st.session_state.policy_bm25
-    eml_bm = st.session_state.email_bm25
-
-    def bm25_for_node(node_id: str) -> float:
-        if node_id in pol_cache:
-            rec = pol_cache[node_id]
-            return bm25_score_row(q_tokens, rec["tf"], rec["dl"], pol_bm["df"], pol_bm["N"], pol_bm["avgdl"])
-        if node_id in eml_cache:
-            rec = eml_cache[node_id]
-            return bm25_score_row(q_tokens, rec["tf"], rec["dl"], eml_bm["df"], eml_bm["N"], eml_bm["avgdl"])
-        return 0.0
-
-    def fuzzy_for_node(node: TextNode) -> float:
-        try:
-            txt = (node.get_text() or "").lower()
-        except Exception:
-            txt = ""
-        return fuzzy_partial(q, txt)
-
-    if cand:
-        reranked = []
-        for nws in cand:
-            dense = norm_sim_dense(nws.score or 0.0)
-            node = nws.node
-            nid = getattr(node, "node_id", None) or getattr(node, "id_", None) or ""
-            bm = bm25_for_node(nid)
-            fz = fuzzy_for_node(node)
-            score = 0.60 * dense + 0.25 * bm + 0.15 * fz
-            reranked.append((score, nws))
-        reranked.sort(key=lambda x: x[0], reverse=True)
-        top = [NodeWithScore(node=pair[1].node, score=pair[0]) for pair in reranked[:k]]
-        if top and top[0].score >= 0.35:
-            return top
-
-    # 3) Row-only sweep if dense is inconclusive
-    row_hits: List[Tuple[float, str, str]] = []  # (score, node_id, corpus)
-    def sweep(cache, bm, corpus):
-        for nid, rec in cache.items():
-            bm_s = bm25_score_row(q_tokens, rec["tf"], rec["dl"], bm["df"], bm["N"], bm["avgdl"])
-            fz_s = fuzzy_partial(q, rec["text"])
-            s = 0.70 * bm_s + 0.30 * fz_s
-            if s > 0:
-                row_hits.append((s, nid, corpus))
-
-    sweep(pol_cache, pol_bm, "policy")
-    sweep(eml_cache, eml_bm, "email")
-
-    if not row_hits:
-        return []
-
-    row_hits.sort(key=lambda x: x[0], reverse=True)
-    row_hits = row_hits[:k]
-
     out: List[NodeWithScore] = []
-    for score, nid, corpus in row_hits:
-        index = st.session_state.policy_index if corpus == "policy" else st.session_state.email_index
-        if not index:
-            continue
-        ds = getattr(index, "_docstore", None) or index.storage_context.docstore
-        node = ds.get_document(nid, raise_error=False)
-        if node is not None:
-            out.append(NodeWithScore(node=node, score=score))
+    out += _safe_retrieve_with_fallback(st.session_state.policy_index, "policy", q, k)
+    out += _safe_retrieve_with_fallback(st.session_state.email_index,  "email",  q, k)
     return out
 
-# ---------------------------
-# Evidence formatting
-# ---------------------------
 def nodes_to_evidence(nodes_ws: List[NodeWithScore]) -> Tuple[str, Dict[str, str], Dict[str, float], Dict[str, Optional[int]]]:
     evidence_lines: List[str] = []
     tag_to_file: Dict[str, str] = {}
